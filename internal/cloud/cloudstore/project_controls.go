@@ -1,156 +1,161 @@
 package cloudstore
 
 import (
+	"context"
 	"database/sql"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
-var ErrProjectSyncPaused = errors.New("cloudstore: project sync paused")
-
+// ProjectSyncControl holds the per-project sync enable/pause record.
+// The backing table is cloud_project_controls (Postgres, added in migrate()).
 type ProjectSyncControl struct {
-	Project      string  `json:"project"`
-	SyncEnabled  bool    `json:"sync_enabled"`
-	PausedReason *string `json:"paused_reason,omitempty"`
-	UpdatedAt    string  `json:"updated_at"`
-	UpdatedBy    *string `json:"updated_by,omitempty"`
+	Project      string
+	SyncEnabled  bool
+	PausedReason *string
+	UpdatedAt    string
+	UpdatedBy    *string
 }
 
+// IsProjectSyncEnabled returns whether sync is enabled for the project.
+// An absent row defaults to enabled=true (safe default).
 func (cs *CloudStore) IsProjectSyncEnabled(project string) (bool, error) {
+	if cs == nil || cs.db == nil {
+		return true, nil
+	}
 	project = strings.TrimSpace(project)
 	if project == "" {
 		return true, nil
 	}
-
 	var enabled bool
-	err := cs.db.QueryRow(
+	err := cs.db.QueryRowContext(
+		context.Background(),
 		`SELECT sync_enabled FROM cloud_project_controls WHERE project = $1`,
 		project,
 	).Scan(&enabled)
+	if err == sql.ErrNoRows {
+		return true, nil
+	}
 	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return true, nil
-		}
-		return false, fmt.Errorf("cloudstore: get project control: %w", err)
+		// BW8: Fail closed — return (false, error) so callers that ignore the error
+		// do not silently permit mutations for projects with unknown sync state.
+		return false, fmt.Errorf("cloudstore: IsProjectSyncEnabled: %w", err)
 	}
 	return enabled, nil
 }
 
+// SetProjectSyncEnabled upserts the project sync control record.
 func (cs *CloudStore) SetProjectSyncEnabled(project string, enabled bool, updatedBy, reason string) error {
+	if cs == nil || cs.db == nil {
+		return fmt.Errorf("cloudstore: not initialized")
+	}
 	project = strings.TrimSpace(project)
 	if project == "" {
-		return fmt.Errorf("cloudstore: project must not be empty")
+		return fmt.Errorf("cloudstore: SetProjectSyncEnabled: project is empty")
 	}
-	reason = strings.TrimSpace(reason)
-	if enabled {
-		reason = ""
+	var reasonPtr *string
+	if r := strings.TrimSpace(reason); r != "" {
+		reasonPtr = &r
 	}
-
-	_, err := cs.db.Exec(
+	var updatedByPtr *string
+	if u := strings.TrimSpace(updatedBy); u != "" {
+		updatedByPtr = &u
+	}
+	_, err := cs.db.ExecContext(
+		context.Background(),
 		`INSERT INTO cloud_project_controls (project, sync_enabled, paused_reason, updated_by, updated_at)
-		 VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, '')::uuid, NOW())
+		 VALUES ($1, $2, $3, $4, $5)
 		 ON CONFLICT (project) DO UPDATE SET
-		   sync_enabled = EXCLUDED.sync_enabled,
-		   paused_reason = EXCLUDED.paused_reason,
-		   updated_by = EXCLUDED.updated_by,
-		   updated_at = NOW()`,
-		project, enabled, reason, updatedBy,
+		     sync_enabled  = EXCLUDED.sync_enabled,
+		     paused_reason = EXCLUDED.paused_reason,
+		     updated_by    = EXCLUDED.updated_by,
+		     updated_at    = EXCLUDED.updated_at`,
+		project, enabled, reasonPtr, updatedByPtr, time.Now().UTC(),
 	)
 	if err != nil {
-		return fmt.Errorf("cloudstore: set project control: %w", err)
+		return fmt.Errorf("cloudstore: SetProjectSyncEnabled: %w", err)
 	}
+	// W4: invalidate the dashboard read model cache so SystemHealth / paused_projects
+	// reflect the change immediately without waiting for the next chunk write.
+	cs.invalidateDashboardReadModel()
 	return nil
 }
 
+// GetProjectSyncControl returns the control record for a project, or nil if absent.
 func (cs *CloudStore) GetProjectSyncControl(project string) (*ProjectSyncControl, error) {
-	controls, err := cs.ListProjectSyncControls()
-	if err != nil {
-		return nil, err
+	if cs == nil || cs.db == nil {
+		return nil, fmt.Errorf("cloudstore: not initialized")
 	}
-	for i := range controls {
-		if controls[i].Project == project {
-			return &controls[i], nil
-		}
-	}
-	if strings.TrimSpace(project) == "" {
+	project = strings.TrimSpace(project)
+	if project == "" {
 		return nil, nil
 	}
-	return &ProjectSyncControl{Project: project, SyncEnabled: true}, nil
+	var ctrl ProjectSyncControl
+	var updatedAt time.Time
+	err := cs.db.QueryRowContext(
+		context.Background(),
+		`SELECT project, sync_enabled, paused_reason, updated_by, updated_at
+		 FROM cloud_project_controls WHERE project = $1`,
+		project,
+	).Scan(&ctrl.Project, &ctrl.SyncEnabled, &ctrl.PausedReason, &ctrl.UpdatedBy, &updatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("cloudstore: GetProjectSyncControl: %w", err)
+	}
+	ctrl.UpdatedAt = updatedAt.UTC().Format(time.RFC3339)
+	return &ctrl, nil
 }
 
+// ListProjectSyncControls returns all project controls UNION DISTINCT projects
+// known from cloud_chunks (projects with no explicit control row default to enabled).
 func (cs *CloudStore) ListProjectSyncControls() ([]ProjectSyncControl, error) {
-	rows, err := cs.db.Query(`
-		WITH known_projects AS (
-			SELECT DISTINCT project FROM cloud_sessions WHERE project <> ''
-			UNION
-			SELECT DISTINCT COALESCE(project, '') AS project FROM cloud_observations WHERE COALESCE(project, '') <> ''
-			UNION
-			SELECT DISTINCT COALESCE(project, '') AS project FROM cloud_prompts WHERE COALESCE(project, '') <> ''
-			UNION
-			SELECT project FROM cloud_project_controls
-		)
-		SELECT kp.project,
-		       COALESCE(cpc.sync_enabled, TRUE) AS sync_enabled,
-		       cpc.paused_reason,
-		       COALESCE(to_char(cpc.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'), '') AS updated_at,
-		       cu.username
-		FROM known_projects kp
-		LEFT JOIN cloud_project_controls cpc ON cpc.project = kp.project
-		LEFT JOIN cloud_users cu ON cu.id = cpc.updated_by
-		WHERE kp.project <> ''
-		ORDER BY kp.project ASC`)
+	if cs == nil || cs.db == nil {
+		return nil, fmt.Errorf("cloudstore: not initialized")
+	}
+	// UNION ensures projects that have synced chunks appear even without a control row.
+	rows, err := cs.db.QueryContext(context.Background(), `
+		SELECT
+		    p.project,
+		    COALESCE(c.sync_enabled, TRUE)   AS sync_enabled,
+		    c.paused_reason,
+		    c.updated_by,
+		    c.updated_at
+		FROM (
+		    SELECT DISTINCT project_name AS project FROM cloud_chunks
+		    UNION
+		    SELECT project FROM cloud_project_controls
+		) p
+		LEFT JOIN cloud_project_controls c ON c.project = p.project
+		ORDER BY p.project
+	`)
 	if err != nil {
-		return nil, fmt.Errorf("cloudstore: list project controls: %w", err)
+		return nil, fmt.Errorf("cloudstore: ListProjectSyncControls: %w", err)
 	}
 	defer rows.Close()
 
-	var controls []ProjectSyncControl
+	var result []ProjectSyncControl
 	for rows.Next() {
-		var control ProjectSyncControl
-		if err := rows.Scan(&control.Project, &control.SyncEnabled, &control.PausedReason, &control.UpdatedAt, &control.UpdatedBy); err != nil {
-			return nil, fmt.Errorf("cloudstore: scan project control: %w", err)
+		var ctrl ProjectSyncControl
+		var updatedAt *time.Time
+		if err := rows.Scan(
+			&ctrl.Project,
+			&ctrl.SyncEnabled,
+			&ctrl.PausedReason,
+			&ctrl.UpdatedBy,
+			&updatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("cloudstore: ListProjectSyncControls scan: %w", err)
 		}
-		if control.UpdatedAt == "" {
-			control.UpdatedAt = ""
+		if updatedAt != nil {
+			ctrl.UpdatedAt = updatedAt.UTC().Format(time.RFC3339)
 		}
-		controls = append(controls, control)
+		result = append(result, ctrl)
 	}
-	return controls, rows.Err()
-}
-
-func projectFromMutation(entity string, payload json.RawMessage) (string, error) {
-	entity = strings.TrimSpace(entity)
-	if len(payload) == 0 {
-		return "", nil
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("cloudstore: ListProjectSyncControls iterate: %w", err)
 	}
-	var decoded struct {
-		Project *string `json:"project"`
-	}
-	if err := decodeMutationPayload(payload, &decoded); err != nil {
-		return "", err
-	}
-	if decoded.Project == nil {
-		return "", nil
-	}
-	return strings.TrimSpace(*decoded.Project), nil
-}
-
-func (cs *CloudStore) ensureProjectSyncEnabled(entity string, payload json.RawMessage) error {
-	project, err := projectFromMutation(entity, payload)
-	if err != nil {
-		return fmt.Errorf("cloudstore: decode project from mutation: %w", err)
-	}
-	if project == "" {
-		return nil
-	}
-	enabled, err := cs.IsProjectSyncEnabled(project)
-	if err != nil {
-		return err
-	}
-	if !enabled {
-		return fmt.Errorf("%w: %s", ErrProjectSyncPaused, project)
-	}
-	return nil
+	return result, nil
 }

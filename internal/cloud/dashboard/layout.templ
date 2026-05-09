@@ -2,6 +2,7 @@ package dashboard
 
 // Layout wraps page content in the base HTML shell with nav, head, and footer.
 // activeTab should be one of: "dashboard", "browser", "projects", "contributors", "admin".
+// ADAPTED: username comes from Principal.DisplayName() at the call site (no context reads).
 templ Layout(title string, username string, activeTab string, isAdmin bool, content templ.Component) {
 	<!DOCTYPE html>
 	<html lang="en" data-theme="dark">
@@ -28,7 +29,7 @@ templ Layout(title string, username string, activeTab string, isAdmin bool, cont
 						<div class="user-info">
 							<span class="user-name">{ username }</span>
 							<form method="post" action="/dashboard/logout" style="margin:0">
-								<button type="submit" class="outline secondary shell-button">
+								<button type="submit" class="user-link logout-link">
 									Logout
 								</button>
 							</form>

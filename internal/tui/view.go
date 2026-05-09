@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Gentleman-Programming/engram/internal/version"
 	"github.com/charmbracelet/lipgloss"
 )
 
@@ -101,7 +102,11 @@ func (m Model) viewDashboard() string {
 
 	// Update notification
 	if m.UpdateMsg != "" {
-		b.WriteString(updateBannerStyle.Render(m.UpdateMsg))
+		bannerStyle := updateBannerStyle
+		if m.UpdateStatus == version.StatusCheckFailed {
+			bannerStyle = errorStyle
+		}
+		b.WriteString(bannerStyle.Render(m.UpdateMsg))
 		b.WriteString("\n\n")
 	}
 
@@ -320,8 +325,15 @@ func (m Model) viewObservationDetail() string {
 	b.WriteString(sectionHeadingStyle.Render("  Content"))
 	b.WriteString("\n")
 
-	// Split content into lines and apply scroll
-	contentLines := strings.Split(obs.Content, "\n")
+	// Wrap content based on terminal width
+	wrapWidth := m.Width - 6 // basic padding
+	if wrapWidth < 20 {
+		wrapWidth = 20
+	}
+	wrappedContent := detailContentStyle.Width(wrapWidth).Render(obs.Content)
+
+	// Split wrapped content into lines
+	contentLines := strings.Split(wrappedContent, "\n")
 	maxLines := m.Height - 16
 	if maxLines < 5 {
 		maxLines = 5
@@ -342,7 +354,7 @@ func (m Model) viewObservationDetail() string {
 	}
 
 	for i := m.DetailScroll; i < end; i++ {
-		b.WriteString(detailContentStyle.Render(contentLines[i]))
+		b.WriteString(contentLines[i])
 		b.WriteString("\n")
 	}
 

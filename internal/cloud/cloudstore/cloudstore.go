@@ -1,1035 +1,700 @@
-// Package cloudstore implements the Postgres-backed storage layer for Engram Cloud.
-//
-// It mirrors the local SQLite store but uses Postgres with row-level user
-// isolation, full-text search via tsvector, and chunk-based sync storage.
 package cloudstore
 
 import (
-	"crypto/sha256"
+	"context"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
+	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/Gentleman-Programming/engram/internal/cloud"
-	_ "github.com/lib/pq"
-	"golang.org/x/crypto/bcrypt"
+	"github.com/Gentleman-Programming/engram/internal/cloud/chunkcodec"
+	"github.com/Gentleman-Programming/engram/internal/store"
+	engramsync "github.com/Gentleman-Programming/engram/internal/sync"
+	"github.com/jackc/pgx/v5/pgconn"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-// openDB is a test seam matching the pattern from internal/store/store.go:23.
-var openDB = sql.Open
-
-// ─── Types ──────────────────────────────────────────────────────────────────
-
-// CloudUser represents a registered user in the cloud system.
-type CloudUser struct {
-	ID           string  `json:"id"`
-	Username     string  `json:"username"`
-	Email        string  `json:"email"`
-	PasswordHash string  `json:"-"`
-	APIKeyHash   *string `json:"-"`
-	CreatedAt    string  `json:"created_at"`
-	UpdatedAt    string  `json:"updated_at"`
-}
-
-// CloudSession represents a session record scoped to a user.
-type CloudSession struct {
-	ID        string  `json:"id"`
-	UserID    string  `json:"user_id"`
-	Project   string  `json:"project"`
-	Directory string  `json:"directory"`
-	StartedAt string  `json:"started_at"`
-	EndedAt   *string `json:"ended_at,omitempty"`
-	Summary   *string `json:"summary,omitempty"`
-}
-
-// CloudSessionSummary holds session info with an observation count.
-type CloudSessionSummary struct {
-	ID               string  `json:"id"`
-	Project          string  `json:"project"`
-	StartedAt        string  `json:"started_at"`
-	EndedAt          *string `json:"ended_at,omitempty"`
-	Summary          *string `json:"summary,omitempty"`
-	ObservationCount int     `json:"observation_count"`
-}
-
-// CloudObservation represents an observation scoped to a user.
-type CloudObservation struct {
-	ID             int64   `json:"id"`
-	UserID         string  `json:"user_id"`
-	SessionID      string  `json:"session_id"`
-	Type           string  `json:"type"`
-	Title          string  `json:"title"`
-	Content        string  `json:"content"`
-	ToolName       *string `json:"tool_name,omitempty"`
-	Project        *string `json:"project,omitempty"`
-	Scope          string  `json:"scope"`
-	TopicKey       *string `json:"topic_key,omitempty"`
-	RevisionCount  int     `json:"revision_count"`
-	DuplicateCount int     `json:"duplicate_count"`
-	LastSeenAt     *string `json:"last_seen_at,omitempty"`
-	CreatedAt      string  `json:"created_at"`
-	UpdatedAt      string  `json:"updated_at"`
-	DeletedAt      *string `json:"deleted_at,omitempty"`
-}
-
-// AddCloudObservationParams holds parameters for creating a new observation.
-type AddCloudObservationParams struct {
-	SessionID string `json:"session_id"`
-	Type      string `json:"type"`
-	Title     string `json:"title"`
-	Content   string `json:"content"`
-	ToolName  string `json:"tool_name,omitempty"`
-	Project   string `json:"project,omitempty"`
-	Scope     string `json:"scope,omitempty"`
-	TopicKey  string `json:"topic_key,omitempty"`
-}
-
-// CloudPrompt represents a user prompt scoped to a user.
-type CloudPrompt struct {
-	ID        int64  `json:"id"`
-	UserID    string `json:"user_id"`
-	SessionID string `json:"session_id"`
-	Content   string `json:"content"`
-	Project   string `json:"project,omitempty"`
-	CreatedAt string `json:"created_at"`
-}
-
-// AddCloudPromptParams holds parameters for creating a new prompt.
-type AddCloudPromptParams struct {
-	SessionID string `json:"session_id"`
-	Content   string `json:"content"`
-	Project   string `json:"project,omitempty"`
-}
-
-// CloudChunkEntry describes a sync chunk stored in the cloud.
-type CloudChunkEntry struct {
-	ChunkID    string `json:"chunk_id"`
-	UserID     string `json:"user_id"`
-	CreatedBy  string `json:"created_by"`
-	Sessions   int    `json:"sessions"`
-	Memories   int    `json:"memories"`
-	Prompts    int    `json:"prompts"`
-	ImportedAt string `json:"imported_at"`
-}
-
-// CloudStats holds aggregate statistics for a user.
-type CloudStats struct {
-	TotalSessions     int      `json:"total_sessions"`
-	TotalObservations int      `json:"total_observations"`
-	TotalPrompts      int      `json:"total_prompts"`
-	Projects          []string `json:"projects"`
-}
-
-// ─── CloudStore ─────────────────────────────────────────────────────────────
-
-// CloudStore provides Postgres-backed storage for Engram Cloud.
 type CloudStore struct {
-	db *sql.DB
+	db                     *sql.DB
+	dashboardAllowedScopes map[string]struct{}
+	dashboardReadModelMu   sync.RWMutex
+	dashboardReadModel     dashboardReadModel
+	dashboardReadModelOK   bool
+	dashboardReadModelLoad func() (dashboardReadModel, error)
 }
 
-// New creates a new CloudStore. It opens a Postgres connection using the DSN
-// from cfg, configures the connection pool, and runs schema initialization
-// inside a single transaction.
+var ErrChunkNotFound = errors.New("cloudstore: chunk not found")
+var ErrChunkConflict = errors.New("cloudstore: chunk id conflict")
+
 func New(cfg cloud.Config) (*CloudStore, error) {
-	db, err := openDB("postgres", cfg.DSN)
+	dsn := strings.TrimSpace(cfg.DSN)
+	if dsn == "" {
+		return nil, fmt.Errorf("cloudstore: database dsn is required")
+	}
+	db, err := sql.Open("pgx", dsn)
 	if err != nil {
-		return nil, fmt.Errorf("cloudstore: open db: %w", err)
+		return nil, fmt.Errorf("cloudstore: open postgres: %w", err)
 	}
-
-	db.SetMaxOpenConns(cfg.MaxPool)
-	db.SetMaxIdleConns(cfg.MaxPool / 2)
-	db.SetConnMaxLifetime(30 * time.Minute)
-
-	if err := db.Ping(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("cloudstore: ping: %w", err)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("cloudstore: ping postgres: %w", err)
 	}
-
-	// Run schema DDL inside a transaction for atomicity.
-	tx, err := db.Begin()
-	if err != nil {
-		db.Close()
-		return nil, fmt.Errorf("cloudstore: begin schema tx: %w", err)
+	store := &CloudStore{db: db}
+	if err := store.migrate(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
 	}
-	if _, err := tx.Exec(schemaDDL); err != nil {
-		tx.Rollback()
-		db.Close()
-		return nil, fmt.Errorf("cloudstore: schema init: %w", err)
-	}
-	if _, err := tx.Exec(`ALTER TABLE cloud_project_controls ADD COLUMN IF NOT EXISTS paused_reason TEXT`); err != nil {
-		tx.Rollback()
-		db.Close()
-		return nil, fmt.Errorf("cloudstore: project controls migration: %w", err)
-	}
-	if err := tx.Commit(); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("cloudstore: commit schema tx: %w", err)
-	}
-
-	return &CloudStore{db: db}, nil
+	return store, nil
 }
 
-// Close closes the underlying database connection.
 func (cs *CloudStore) Close() error {
-	return cs.db.Close()
-}
-
-// DB returns the underlying *sql.DB for advanced use cases (e.g. testing).
-func (cs *CloudStore) DB() *sql.DB {
-	return cs.db
-}
-
-// Ping checks whether the underlying database connection is currently healthy.
-func (cs *CloudStore) Ping() error {
 	if cs == nil || cs.db == nil {
 		return nil
 	}
-	return cs.db.Ping()
+	return cs.db.Close()
 }
 
-// ─── User CRUD ──────────────────────────────────────────────────────────────
-
-// CreateUser creates a new user with a bcrypt-hashed password (cost >= 10).
-// Returns an error if the username or email already exists.
-func (cs *CloudStore) CreateUser(username, email, password string) (*CloudUser, error) {
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), 10)
-	if err != nil {
-		return nil, fmt.Errorf("cloudstore: hash password: %w", err)
+func (cs *CloudStore) SetDashboardAllowedProjects(projects []string) {
+	if cs == nil {
+		return
 	}
+	cs.dashboardAllowedScopes = make(map[string]struct{})
+	for _, project := range projects {
+		project = strings.TrimSpace(project)
+		if project == "" {
+			continue
+		}
+		cs.dashboardAllowedScopes[project] = struct{}{}
+	}
+	cs.invalidateDashboardReadModel()
+}
 
-	var u CloudUser
-	err = cs.db.QueryRow(
-		`INSERT INTO cloud_users (username, email, password_hash)
-		 VALUES ($1, $2, $3)
-		 RETURNING id, username, email, password_hash, api_key_hash, created_at, updated_at`,
-		username, email, string(hash),
-	).Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.APIKeyHash, &u.CreatedAt, &u.UpdatedAt)
-	if err != nil {
+type User struct {
+	ID           string
+	Username     string
+	Email        string
+	PasswordHash string
+}
+
+func (cs *CloudStore) CreateUser(username, email, _ string) (*User, error) {
+	if cs == nil || cs.db == nil {
+		return nil, fmt.Errorf("cloudstore: not initialized")
+	}
+	const q = `
+		INSERT INTO cloud_users (username, email, password_hash)
+		VALUES ($1, $2, '')
+		ON CONFLICT (username) DO UPDATE SET email = EXCLUDED.email
+		RETURNING id::text, username, email, password_hash`
+	var u User
+	if err := cs.db.QueryRowContext(context.Background(), q, strings.TrimSpace(username), strings.TrimSpace(email)).Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash); err != nil {
 		return nil, fmt.Errorf("cloudstore: create user: %w", err)
 	}
 	return &u, nil
 }
 
-// GetUserByUsername retrieves a user by username.
-func (cs *CloudStore) GetUserByUsername(username string) (*CloudUser, error) {
-	var u CloudUser
-	err := cs.db.QueryRow(
-		`SELECT id, username, email, password_hash, api_key_hash, created_at, updated_at
-		 FROM cloud_users WHERE username = $1`,
-		username,
-	).Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.APIKeyHash, &u.CreatedAt, &u.UpdatedAt)
+func (cs *CloudStore) GetUserByUsername(username string) (*User, error) {
+	if cs == nil || cs.db == nil {
+		return nil, fmt.Errorf("cloudstore: not initialized")
+	}
+	const q = `SELECT id::text, username, email, password_hash FROM cloud_users WHERE username = $1`
+	var u User
+	err := cs.db.QueryRowContext(context.Background(), q, strings.TrimSpace(username)).Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
 	if err != nil {
-		return nil, fmt.Errorf("cloudstore: get user by username: %w", err)
+		return nil, fmt.Errorf("cloudstore: lookup user by username: %w", err)
 	}
 	return &u, nil
 }
 
-// GetUserByEmail retrieves a user by email address.
-func (cs *CloudStore) GetUserByEmail(email string) (*CloudUser, error) {
-	var u CloudUser
-	err := cs.db.QueryRow(
-		`SELECT id, username, email, password_hash, api_key_hash, created_at, updated_at
-		 FROM cloud_users WHERE email = $1`,
-		email,
-	).Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.APIKeyHash, &u.CreatedAt, &u.UpdatedAt)
+func (cs *CloudStore) GetUserByEmail(email string) (*User, error) {
+	if cs == nil || cs.db == nil {
+		return nil, fmt.Errorf("cloudstore: not initialized")
+	}
+	const q = `SELECT id::text, username, email, password_hash FROM cloud_users WHERE email = $1`
+	var u User
+	err := cs.db.QueryRowContext(context.Background(), q, strings.TrimSpace(email)).Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
 	if err != nil {
-		return nil, fmt.Errorf("cloudstore: get user by email: %w", err)
+		return nil, fmt.Errorf("cloudstore: lookup user by email: %w", err)
 	}
 	return &u, nil
 }
 
-// GetUserByAPIKeyHash retrieves a user by their API key hash.
-func (cs *CloudStore) GetUserByAPIKeyHash(hash string) (*CloudUser, error) {
-	var u CloudUser
-	err := cs.db.QueryRow(
-		`SELECT id, username, email, password_hash, api_key_hash, created_at, updated_at
-		 FROM cloud_users WHERE api_key_hash = $1`,
-		hash,
-	).Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.APIKeyHash, &u.CreatedAt, &u.UpdatedAt)
+func (cs *CloudStore) ReadManifest(ctx context.Context, project string) (*engramsync.Manifest, error) {
+	if cs == nil || cs.db == nil {
+		return nil, fmt.Errorf("cloudstore: not initialized")
+	}
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return nil, fmt.Errorf("cloudstore: project is required")
+	}
+	rows, err := cs.db.QueryContext(ctx, `
+		SELECT chunk_id, created_by, COALESCE(client_created_at, created_at) AS manifest_created_at, sessions_count, observations_count, prompts_count, created_at
+		FROM cloud_chunks
+		WHERE project_name = $1
+		ORDER BY created_at ASC, chunk_id ASC`, project)
 	if err != nil {
-		return nil, fmt.Errorf("cloudstore: get user by api key hash: %w", err)
-	}
-	return &u, nil
-}
-
-// GetUserByID retrieves a user by id.
-func (cs *CloudStore) GetUserByID(userID string) (*CloudUser, error) {
-	var u CloudUser
-	err := cs.db.QueryRow(
-		`SELECT id, username, email, password_hash, api_key_hash, created_at, updated_at
-		 FROM cloud_users WHERE id = $1`,
-		userID,
-	).Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.APIKeyHash, &u.CreatedAt, &u.UpdatedAt)
-	if err != nil {
-		return nil, fmt.Errorf("cloudstore: get user by id: %w", err)
-	}
-	return &u, nil
-}
-
-// SetAPIKeyHash sets the API key hash for a user. Pass an empty string to revoke.
-func (cs *CloudStore) SetAPIKeyHash(userID, hash string) error {
-	var h *string
-	if hash != "" {
-		h = &hash
-	}
-	_, err := cs.db.Exec(
-		`UPDATE cloud_users SET api_key_hash = $1, updated_at = NOW() WHERE id = $2`,
-		h, userID,
-	)
-	if err != nil {
-		return fmt.Errorf("cloudstore: set api key hash: %w", err)
-	}
-	return nil
-}
-
-// ─── Sessions ───────────────────────────────────────────────────────────────
-
-// CreateSession creates a new session for the given user.
-func (cs *CloudStore) CreateSession(userID, sessionID, project, directory string) error {
-	_, err := cs.db.Exec(
-		`INSERT INTO cloud_sessions (id, user_id, project, directory)
-		 VALUES ($1, $2, $3, $4)
-		 ON CONFLICT (user_id, id) DO UPDATE SET
-		   project   = CASE WHEN cloud_sessions.project = '' THEN EXCLUDED.project ELSE cloud_sessions.project END,
-		   directory = CASE WHEN cloud_sessions.directory = '' THEN EXCLUDED.directory ELSE cloud_sessions.directory END`,
-		sessionID, userID, project, directory,
-	)
-	if err != nil {
-		return fmt.Errorf("cloudstore: create session: %w", err)
-	}
-	return nil
-}
-
-// EndSession ends a session by setting ended_at and an optional summary.
-// Filters by user_id to ensure data isolation.
-func (cs *CloudStore) EndSession(userID, sessionID, summary string) error {
-	_, err := cs.db.Exec(
-		`UPDATE cloud_sessions SET ended_at = NOW(), summary = $1
-		 WHERE user_id = $2 AND id = $3`,
-		nullableString(summary), userID, sessionID,
-	)
-	if err != nil {
-		return fmt.Errorf("cloudstore: end session: %w", err)
-	}
-	return nil
-}
-
-// RecentSessions returns the most recent sessions for a user, optionally filtered
-// by project, with observation counts.
-func (cs *CloudStore) RecentSessions(userID, project string, limit int) ([]CloudSessionSummary, error) {
-	if limit <= 0 {
-		limit = 5
-	}
-
-	query := `
-		SELECT s.id, s.project, s.started_at, s.ended_at, s.summary,
-		       COUNT(o.id) as observation_count
-		FROM cloud_sessions s
-		LEFT JOIN cloud_observations o ON o.session_id = s.id AND o.user_id = s.user_id AND o.deleted_at IS NULL
-		WHERE s.user_id = $1
-	`
-	args := []any{userID}
-	argN := 2
-
-	if project != "" {
-		query += fmt.Sprintf(" AND s.project = $%d", argN)
-		args = append(args, project)
-		argN++
-	}
-
-	query += fmt.Sprintf(" GROUP BY s.id, s.user_id, s.project, s.started_at, s.ended_at, s.summary ORDER BY MAX(COALESCE(o.created_at, s.started_at)) DESC LIMIT $%d", argN)
-	args = append(args, limit)
-
-	rows, err := cs.db.Query(query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("cloudstore: recent sessions: %w", err)
+		return nil, fmt.Errorf("cloudstore: query manifest: %w", err)
 	}
 	defer rows.Close()
 
-	var results []CloudSessionSummary
+	manifestRows := make([]manifestRow, 0)
 	for rows.Next() {
-		var ss CloudSessionSummary
-		if err := rows.Scan(&ss.ID, &ss.Project, &ss.StartedAt, &ss.EndedAt, &ss.Summary, &ss.ObservationCount); err != nil {
-			return nil, fmt.Errorf("cloudstore: scan session summary: %w", err)
+		var row manifestRow
+		if err := rows.Scan(&row.chunkID, &row.createdBy, &row.manifestTime, &row.sessions, &row.observations, &row.prompts, &row.serverCreated); err != nil {
+			return nil, fmt.Errorf("cloudstore: scan manifest: %w", err)
 		}
-		results = append(results, ss)
+		manifestRows = append(manifestRows, row)
 	}
-	return results, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("cloudstore: iterate manifest: %w", err)
+	}
+	return &engramsync.Manifest{Version: 1, Chunks: toManifestEntries(manifestRows)}, nil
 }
 
-// GetSession retrieves a single session by ID, scoped to user_id.
-func (cs *CloudStore) GetSession(userID, sessionID string) (*CloudSession, error) {
-	var s CloudSession
-	err := cs.db.QueryRow(
-		`SELECT id, user_id, project, directory, started_at, ended_at, summary
-		 FROM cloud_sessions
-		 WHERE id = $1 AND user_id = $2`,
-		sessionID, userID,
-	).Scan(&s.ID, &s.UserID, &s.Project, &s.Directory, &s.StartedAt, &s.EndedAt, &s.Summary)
-	if err != nil {
-		return nil, fmt.Errorf("cloudstore: get session: %w", err)
-	}
-	return &s, nil
+type manifestRow struct {
+	chunkID       string
+	createdBy     string
+	manifestTime  time.Time
+	sessions      int
+	observations  int
+	prompts       int
+	serverCreated time.Time
 }
 
-// SessionObservations returns all live observations for a single session.
-func (cs *CloudStore) SessionObservations(userID, sessionID string, limit int) ([]CloudObservation, error) {
-	if limit <= 0 {
-		limit = 200
-	}
-
-	rows, err := cs.db.Query(
-		`SELECT id, user_id, session_id, type, title, content, tool_name, project,
-		        scope, topic_key, revision_count, duplicate_count, last_seen_at,
-		        created_at, updated_at, deleted_at
-		 FROM cloud_observations
-		 WHERE user_id = $1 AND session_id = $2 AND deleted_at IS NULL
-		 ORDER BY created_at ASC
-		 LIMIT $3`,
-		userID, sessionID, limit,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("cloudstore: session observations: %w", err)
-	}
-	defer rows.Close()
-
-	var results []CloudObservation
-	for rows.Next() {
-		var o CloudObservation
-		if err := rows.Scan(
-			&o.ID, &o.UserID, &o.SessionID, &o.Type, &o.Title, &o.Content,
-			&o.ToolName, &o.Project, &o.Scope, &o.TopicKey,
-			&o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt,
-			&o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
-		); err != nil {
-			return nil, fmt.Errorf("cloudstore: scan session observation: %w", err)
+func toManifestEntries(rows []manifestRow) []engramsync.ChunkEntry {
+	sort.Slice(rows, func(i, j int) bool {
+		left, right := rows[i], rows[j]
+		if !left.serverCreated.Equal(right.serverCreated) {
+			return left.serverCreated.Before(right.serverCreated)
 		}
-		results = append(results, o)
+		return left.chunkID < right.chunkID
+	})
+	entries := make([]engramsync.ChunkEntry, 0, len(rows))
+	for _, row := range rows {
+		entries = append(entries, engramsync.ChunkEntry{
+			ID:        row.chunkID,
+			CreatedBy: row.createdBy,
+			CreatedAt: row.manifestTime.UTC().Format(time.RFC3339),
+			Sessions:  row.sessions,
+			Memories:  row.observations,
+			Prompts:   row.prompts,
+		})
 	}
-	return results, rows.Err()
+	return entries
 }
 
-// SessionPrompts returns prompts captured during a single session.
-func (cs *CloudStore) SessionPrompts(userID, sessionID string, limit int) ([]CloudPrompt, error) {
-	if limit <= 0 {
-		limit = 200
+func (cs *CloudStore) WriteChunk(ctx context.Context, project, chunkID, createdBy, clientCreatedAt string, payload []byte) error {
+	if cs == nil || cs.db == nil {
+		return fmt.Errorf("cloudstore: not initialized")
 	}
-
-	rows, err := cs.db.Query(
-		`SELECT id, user_id, session_id, content, COALESCE(project, '') AS project, created_at
-		 FROM cloud_prompts
-		 WHERE user_id = $1 AND session_id = $2
-		 ORDER BY created_at ASC
-		 LIMIT $3`,
-		userID, sessionID, limit,
-	)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return fmt.Errorf("cloudstore: project is required")
+	}
+	if strings.TrimSpace(chunkID) == "" {
+		return fmt.Errorf("cloudstore: chunk id is required")
+	}
+	expectedChunkID := chunkIDFromPayload(payload)
+	if chunkID != expectedChunkID {
+		return fmt.Errorf("cloudstore: chunk id does not match payload hash (expected %s)", expectedChunkID)
+	}
+	originCreatedAt, err := parseClientCreatedAt(clientCreatedAt)
 	if err != nil {
-		return nil, fmt.Errorf("cloudstore: session prompts: %w", err)
-	}
-	defer rows.Close()
-
-	var results []CloudPrompt
-	for rows.Next() {
-		var p CloudPrompt
-		if err := rows.Scan(&p.ID, &p.UserID, &p.SessionID, &p.Content, &p.Project, &p.CreatedAt); err != nil {
-			return nil, fmt.Errorf("cloudstore: scan session prompt: %w", err)
-		}
-		results = append(results, p)
-	}
-	return results, rows.Err()
-}
-
-// ─── Observations ───────────────────────────────────────────────────────────
-
-// AddObservation creates a new observation for the given user.
-func (cs *CloudStore) AddObservation(userID string, p AddCloudObservationParams) (int64, error) {
-	scope := normalizeScope(p.Scope)
-	normHash := hashNormalized(p.Content)
-
-	var id int64
-	err := cs.db.QueryRow(
-		`INSERT INTO cloud_observations
-		 (user_id, session_id, type, title, content, tool_name, project, scope, topic_key, normalized_hash,
-		  revision_count, duplicate_count, last_seen_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 1, 1, NOW(), NOW())
-		 RETURNING id`,
-		userID, p.SessionID, p.Type, p.Title, p.Content,
-		nullableString(p.ToolName), nullableString(p.Project), scope,
-		nullableString(p.TopicKey), normHash,
-	).Scan(&id)
-	if err != nil {
-		return 0, fmt.Errorf("cloudstore: add observation: %w", err)
-	}
-	return id, nil
-}
-
-// GetObservation retrieves a single observation by ID, scoped to user_id.
-func (cs *CloudStore) GetObservation(userID string, id int64) (*CloudObservation, error) {
-	var o CloudObservation
-	err := cs.db.QueryRow(
-		`SELECT id, user_id, session_id, type, title, content, tool_name, project,
-		        scope, topic_key, revision_count, duplicate_count, last_seen_at,
-		        created_at, updated_at, deleted_at
-		 FROM cloud_observations
-		 WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
-		id, userID,
-	).Scan(
-		&o.ID, &o.UserID, &o.SessionID, &o.Type, &o.Title, &o.Content,
-		&o.ToolName, &o.Project, &o.Scope, &o.TopicKey,
-		&o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt,
-		&o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("cloudstore: get observation: %w", err)
-	}
-	return &o, nil
-}
-
-// RecentObservations returns recent observations for a user, optionally filtered
-// by project and scope.
-func (cs *CloudStore) RecentObservations(userID, project, scope string, limit int) ([]CloudObservation, error) {
-	return cs.FilterObservations(userID, project, scope, "", limit)
-}
-
-// FilterObservations returns recent observations filtered by project, scope, and type.
-func (cs *CloudStore) FilterObservations(userID, project, scope, obsType string, limit int) ([]CloudObservation, error) {
-	if limit <= 0 {
-		limit = 20
-	}
-
-	query := `
-		SELECT id, user_id, session_id, type, title, content, tool_name, project,
-		       scope, topic_key, revision_count, duplicate_count, last_seen_at,
-		       created_at, updated_at, deleted_at
-		FROM cloud_observations
-		WHERE user_id = $1 AND deleted_at IS NULL
-	`
-	args := []any{userID}
-	argN := 2
-
-	if project != "" {
-		query += fmt.Sprintf(" AND project = $%d", argN)
-		args = append(args, project)
-		argN++
-	}
-	if scope != "" {
-		query += fmt.Sprintf(" AND scope = $%d", argN)
-		args = append(args, normalizeScope(scope))
-		argN++
-	}
-	if obsType != "" {
-		query += fmt.Sprintf(" AND type = $%d", argN)
-		args = append(args, obsType)
-		argN++
-	}
-
-	query += fmt.Sprintf(" ORDER BY created_at DESC LIMIT $%d", argN)
-	args = append(args, limit)
-
-	rows, err := cs.db.Query(query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("cloudstore: recent observations: %w", err)
-	}
-	defer rows.Close()
-
-	var results []CloudObservation
-	for rows.Next() {
-		var o CloudObservation
-		if err := rows.Scan(
-			&o.ID, &o.UserID, &o.SessionID, &o.Type, &o.Title, &o.Content,
-			&o.ToolName, &o.Project, &o.Scope, &o.TopicKey,
-			&o.RevisionCount, &o.DuplicateCount, &o.LastSeenAt,
-			&o.CreatedAt, &o.UpdatedAt, &o.DeletedAt,
-		); err != nil {
-			return nil, fmt.Errorf("cloudstore: scan observation: %w", err)
-		}
-		results = append(results, o)
-	}
-	return results, rows.Err()
-}
-
-// DeleteObservation soft-deletes or hard-deletes an observation, scoped to user_id.
-func (cs *CloudStore) DeleteObservation(userID string, id int64, hard bool) error {
-	if hard {
-		_, err := cs.db.Exec(
-			`DELETE FROM cloud_observations WHERE id = $1 AND user_id = $2`,
-			id, userID,
-		)
 		return err
 	}
-	_, err := cs.db.Exec(
-		`UPDATE cloud_observations
-		 SET deleted_at = NOW(), updated_at = NOW()
-		 WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
-		id, userID,
-	)
-	return err
-}
 
-// ─── Prompts ────────────────────────────────────────────────────────────────
-
-// AddPrompt creates a new prompt for the given user.
-func (cs *CloudStore) AddPrompt(userID string, p AddCloudPromptParams) (int64, error) {
-	var id int64
-	err := cs.db.QueryRow(
-		`INSERT INTO cloud_prompts (user_id, session_id, content, project)
-		 VALUES ($1, $2, $3, $4)
-		 RETURNING id`,
-		userID, p.SessionID, p.Content, nullableString(p.Project),
-	).Scan(&id)
-	if err != nil {
-		return 0, fmt.Errorf("cloudstore: add prompt: %w", err)
-	}
-	return id, nil
-}
-
-// RecentPrompts returns recent prompts for a user, optionally filtered by project.
-func (cs *CloudStore) RecentPrompts(userID, project string, limit int) ([]CloudPrompt, error) {
-	if limit <= 0 {
-		limit = 20
-	}
-
-	query := `SELECT id, user_id, session_id, content, COALESCE(project, '') as project, created_at
-	          FROM cloud_prompts WHERE user_id = $1`
-	args := []any{userID}
-	argN := 2
-
-	if project != "" {
-		query += fmt.Sprintf(" AND project = $%d", argN)
-		args = append(args, project)
-		argN++
-	}
-
-	query += fmt.Sprintf(" ORDER BY created_at DESC LIMIT $%d", argN)
-	args = append(args, limit)
-
-	rows, err := cs.db.Query(query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("cloudstore: recent prompts: %w", err)
-	}
-	defer rows.Close()
-
-	var results []CloudPrompt
-	for rows.Next() {
-		var p CloudPrompt
-		if err := rows.Scan(&p.ID, &p.UserID, &p.SessionID, &p.Content, &p.Project, &p.CreatedAt); err != nil {
-			return nil, fmt.Errorf("cloudstore: scan prompt: %w", err)
+	var existingPayload []byte
+	err = cs.db.QueryRowContext(ctx, `SELECT payload::text FROM cloud_chunks WHERE project_name = $1 AND chunk_id = $2`, project, chunkID).Scan(&existingPayload)
+	if err == nil {
+		normalizedIncoming := normalizeJSON(payload)
+		normalizedExisting := normalizeJSON(existingPayload)
+		if string(normalizedIncoming) != string(normalizedExisting) {
+			return fmt.Errorf("%w: existing chunk %q has different payload", ErrChunkConflict, chunkID)
 		}
-		results = append(results, p)
+		_ = cs.indexChunkSessions(ctx, project, payload)
+		cs.invalidateDashboardReadModel()
+		return nil
 	}
-	return results, rows.Err()
-}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("cloudstore: read existing chunk: %w", err)
+	}
 
-// GetPrompt retrieves a single prompt by id, scoped to user_id.
-func (cs *CloudStore) GetPrompt(userID string, id int64) (*CloudPrompt, error) {
-	var p CloudPrompt
-	err := cs.db.QueryRow(
-		`SELECT id, user_id, session_id, content, COALESCE(project, '') AS project, created_at
-		 FROM cloud_prompts
-		 WHERE id = $1 AND user_id = $2`,
-		id, userID,
-	).Scan(&p.ID, &p.UserID, &p.SessionID, &p.Content, &p.Project, &p.CreatedAt)
+	chunk, err := parseChunkData(payload)
 	if err != nil {
-		return nil, fmt.Errorf("cloudstore: get prompt: %w", err)
+		return fmt.Errorf("cloudstore: parse chunk for materialization: %w", err)
 	}
-	return &p, nil
-}
-
-// ─── Chunks ─────────────────────────────────────────────────────────────────
-
-// StoreChunk stores a sync chunk. Uses INSERT ON CONFLICT DO NOTHING for idempotency.
-func (cs *CloudStore) StoreChunk(userID, chunkID, createdBy string, data []byte, sessions, memories, prompts int) error {
-	_, err := cs.db.Exec(
-		`INSERT INTO cloud_chunks (chunk_id, user_id, data, created_by, sessions, memories, prompts)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)
-		 ON CONFLICT (user_id, chunk_id) DO NOTHING`,
-		chunkID, userID, data, createdBy, sessions, memories, prompts,
-	)
+	mutations, err := materializedChunkMutations(project, chunk)
 	if err != nil {
-		return fmt.Errorf("cloudstore: store chunk: %w", err)
+		return err
 	}
-	return nil
-}
 
-// GetChunk retrieves the raw data for a chunk, scoped to user_id.
-func (cs *CloudStore) GetChunk(userID, chunkID string) ([]byte, error) {
-	var data []byte
-	err := cs.db.QueryRow(
-		`SELECT data FROM cloud_chunks WHERE user_id = $1 AND chunk_id = $2`,
-		userID, chunkID,
-	).Scan(&data)
+	tx, err := cs.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("cloudstore: get chunk: %w", err)
+		return fmt.Errorf("cloudstore: begin write chunk tx: %w", err)
 	}
-	return data, nil
-}
-
-// ListChunks returns all chunk entries for a user.
-func (cs *CloudStore) ListChunks(userID string) ([]CloudChunkEntry, error) {
-	rows, err := cs.db.Query(
-		`SELECT chunk_id, user_id, created_by, sessions, memories, prompts, imported_at
-		 FROM cloud_chunks WHERE user_id = $1 ORDER BY imported_at`,
-		userID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("cloudstore: list chunks: %w", err)
-	}
-	defer rows.Close()
-
-	var results []CloudChunkEntry
-	for rows.Next() {
-		var c CloudChunkEntry
-		if err := rows.Scan(&c.ChunkID, &c.UserID, &c.CreatedBy, &c.Sessions, &c.Memories, &c.Prompts, &c.ImportedAt); err != nil {
-			return nil, fmt.Errorf("cloudstore: scan chunk entry: %w", err)
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback()
 		}
-		results = append(results, c)
-	}
-	return results, rows.Err()
-}
+	}()
 
-// RecordSyncedChunk records that a chunk has been synced for a user.
-// Uses INSERT ON CONFLICT DO NOTHING for idempotency.
-func (cs *CloudStore) RecordSyncedChunk(userID, chunkID string) error {
-	_, err := cs.db.Exec(
-		`INSERT INTO cloud_sync_chunks (chunk_id, user_id)
-		 VALUES ($1, $2)
-		 ON CONFLICT (user_id, chunk_id) DO NOTHING`,
-		chunkID, userID,
-	)
+	counts := summarizeChunk(payload)
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO cloud_chunks (project_name, chunk_id, created_by, client_created_at, payload, sessions_count, observations_count, prompts_count)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		project, strings.TrimSpace(chunkID), strings.TrimSpace(createdBy), originCreatedAt, payload, counts.sessions, counts.observations, counts.prompts)
 	if err != nil {
-		return fmt.Errorf("cloudstore: record synced chunk: %w", err)
-	}
-	return nil
-}
-
-// GetSyncedChunks returns a set of chunk IDs that have been synced for a user.
-func (cs *CloudStore) GetSyncedChunks(userID string) (map[string]bool, error) {
-	rows, err := cs.db.Query(
-		`SELECT chunk_id FROM cloud_sync_chunks WHERE user_id = $1`,
-		userID,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("cloudstore: get synced chunks: %w", err)
-	}
-	defer rows.Close()
-
-	result := make(map[string]bool)
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, fmt.Errorf("cloudstore: scan synced chunk: %w", err)
-		}
-		result[id] = true
-	}
-	return result, rows.Err()
-}
-
-// ─── Stats & Context ────────────────────────────────────────────────────────
-
-// Stats returns aggregate statistics for a user.
-func (cs *CloudStore) Stats(userID string) (*CloudStats, error) {
-	stats := &CloudStats{}
-
-	cs.db.QueryRow(
-		`SELECT COUNT(*) FROM cloud_sessions WHERE user_id = $1`, userID,
-	).Scan(&stats.TotalSessions)
-
-	cs.db.QueryRow(
-		`SELECT COUNT(*) FROM cloud_observations WHERE user_id = $1 AND deleted_at IS NULL`, userID,
-	).Scan(&stats.TotalObservations)
-
-	cs.db.QueryRow(
-		`SELECT COUNT(*) FROM cloud_prompts WHERE user_id = $1`, userID,
-	).Scan(&stats.TotalPrompts)
-
-	rows, err := cs.db.Query(
-		`SELECT project FROM cloud_observations
-		 WHERE user_id = $1 AND project IS NOT NULL AND deleted_at IS NULL
-		 GROUP BY project ORDER BY MAX(created_at) DESC`,
-		userID,
-	)
-	if err != nil {
-		return stats, nil
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var p string
-		if err := rows.Scan(&p); err == nil {
-			stats.Projects = append(stats.Projects, p)
-		}
-	}
-
-	return stats, nil
-}
-
-// FormatContext produces a formatted context string for a user, matching the
-// output format of internal/store/store.go's FormatContext method.
-func (cs *CloudStore) FormatContext(userID, project, scope string) (string, error) {
-	sessions, err := cs.RecentSessions(userID, project, 5)
-	if err != nil {
-		return "", err
-	}
-
-	observations, err := cs.RecentObservations(userID, project, scope, 20)
-	if err != nil {
-		return "", err
-	}
-
-	prompts, err := cs.RecentPrompts(userID, project, 10)
-	if err != nil {
-		return "", err
-	}
-
-	if len(sessions) == 0 && len(observations) == 0 && len(prompts) == 0 {
-		return "", nil
-	}
-
-	var b strings.Builder
-	b.WriteString("## Memory from Previous Sessions\n\n")
-
-	if len(sessions) > 0 {
-		b.WriteString("### Recent Sessions\n")
-		for _, sess := range sessions {
-			summary := ""
-			if sess.Summary != nil {
-				summary = fmt.Sprintf(": %s", truncate(*sess.Summary, 200))
+		if isUniqueViolation(err) {
+			conflictErr := cs.resolveChunkConflict(ctx, project, chunkID, payload)
+			if conflictErr != nil {
+				return conflictErr
 			}
-			fmt.Fprintf(&b, "- **%s** (%s)%s [%d observations]\n",
-				sess.Project, sess.StartedAt, summary, sess.ObservationCount)
+			cs.invalidateDashboardReadModel()
+			return nil
 		}
-		b.WriteString("\n")
+		return fmt.Errorf("cloudstore: write chunk: %w", err)
 	}
-
-	if len(prompts) > 0 {
-		b.WriteString("### Recent User Prompts\n")
-		for _, p := range prompts {
-			fmt.Fprintf(&b, "- %s: %s\n", p.CreatedAt, truncate(p.Content, 200))
-		}
-		b.WriteString("\n")
+	if err := cs.indexChunkSessionsWith(ctx, tx, project, payload); err != nil {
+		return err
 	}
-
-	if len(observations) > 0 {
-		b.WriteString("### Recent Observations\n")
-		for _, obs := range observations {
-			fmt.Fprintf(&b, "- [%s] **%s**: %s\n",
-				obs.Type, obs.Title, truncate(obs.Content, 300))
-		}
-		b.WriteString("\n")
+	if err := insertMaterializedMutations(ctx, tx, mutations); err != nil {
+		return err
 	}
-
-	return b.String(), nil
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("cloudstore: commit write chunk: %w", err)
+	}
+	tx = nil
+	cs.invalidateDashboardReadModel()
+	return nil
 }
 
-// ─── Dashboard Queries ──────────────────────────────────────────────────
-
-// ProjectStat holds per-project aggregate data for the dashboard overview.
-type ProjectStat struct {
-	Project          string  `json:"project"`
-	SessionCount     int     `json:"session_count"`
-	ObservationCount int     `json:"observation_count"`
-	PromptCount      int     `json:"prompt_count"`
-	LastActivity     *string `json:"last_activity,omitempty"`
+func (cs *CloudStore) invalidateDashboardReadModel() {
+	if cs == nil {
+		return
+	}
+	cs.dashboardReadModelMu.Lock()
+	defer cs.dashboardReadModelMu.Unlock()
+	cs.dashboardReadModel = dashboardReadModel{}
+	cs.dashboardReadModelOK = false
 }
 
-// ProjectStats returns per-project statistics for a user, ordered by most
-// recent activity. Used by the dashboard overview (Phase 4).
-func (cs *CloudStore) ProjectStats(userID string) ([]ProjectStat, error) {
-	rows, err := cs.db.Query(`
-		SELECT
-			p.project,
-			COALESCE(s.session_count, 0),
-			COALESCE(o.obs_count, 0),
-			COALESCE(pr.prompt_count, 0),
-			GREATEST(s.last_session, o.last_obs, pr.last_prompt) AS last_activity
-		FROM (
-			SELECT DISTINCT COALESCE(project, '') AS project FROM cloud_sessions WHERE user_id = $1
-			UNION
-			SELECT DISTINCT COALESCE(project, '') AS project FROM cloud_observations WHERE user_id = $1 AND deleted_at IS NULL
-			UNION
-			SELECT DISTINCT COALESCE(project, '') AS project FROM cloud_prompts WHERE user_id = $1
-		) p
-		LEFT JOIN (
-			SELECT project, COUNT(*) AS session_count, MAX(started_at) AS last_session
-			FROM cloud_sessions WHERE user_id = $1 GROUP BY project
-		) s ON s.project = p.project
-		LEFT JOIN (
-			SELECT COALESCE(project, '') AS project, COUNT(*) AS obs_count, MAX(created_at) AS last_obs
-			FROM cloud_observations WHERE user_id = $1 AND deleted_at IS NULL GROUP BY COALESCE(project, '')
-		) o ON o.project = p.project
-		LEFT JOIN (
-			SELECT COALESCE(project, '') AS project, COUNT(*) AS prompt_count, MAX(created_at) AS last_prompt
-			FROM cloud_prompts WHERE user_id = $1 GROUP BY COALESCE(project, '')
-		) pr ON pr.project = p.project
-		WHERE p.project != ''
-		ORDER BY last_activity DESC NULLS LAST
-	`, userID)
+func (cs *CloudStore) KnownSessionIDs(ctx context.Context, project string) (map[string]struct{}, error) {
+	if cs == nil || cs.db == nil {
+		return nil, fmt.Errorf("cloudstore: not initialized")
+	}
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return nil, fmt.Errorf("cloudstore: project is required")
+	}
+	rows, err := cs.db.QueryContext(ctx, `SELECT session_id FROM cloud_project_sessions WHERE project_name = $1`, project)
 	if err != nil {
-		return nil, fmt.Errorf("cloudstore: project stats: %w", err)
+		return nil, fmt.Errorf("cloudstore: query session index: %w", err)
 	}
 	defer rows.Close()
 
-	var results []ProjectStat
+	known := make(map[string]struct{})
 	for rows.Next() {
-		var ps ProjectStat
-		if err := rows.Scan(&ps.Project, &ps.SessionCount, &ps.ObservationCount, &ps.PromptCount, &ps.LastActivity); err != nil {
-			return nil, fmt.Errorf("cloudstore: scan project stat: %w", err)
+		var sessionID string
+		if err := rows.Scan(&sessionID); err != nil {
+			return nil, fmt.Errorf("cloudstore: scan session index: %w", err)
 		}
-		results = append(results, ps)
+		sessionID = strings.TrimSpace(sessionID)
+		if sessionID == "" {
+			continue
+		}
+		known[sessionID] = struct{}{}
 	}
-	if results == nil {
-		results = []ProjectStat{}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("cloudstore: iterate session index: %w", err)
 	}
-	return results, rows.Err()
+	return known, nil
 }
 
-// ContributorStat holds per-user aggregate data for the contributors view.
-type ContributorStat struct {
-	UserID           string  `json:"user_id"`
-	Username         string  `json:"username"`
-	Email            string  `json:"email"`
-	SessionCount     int     `json:"session_count"`
-	ObservationCount int     `json:"observation_count"`
-	LastSync         *string `json:"last_sync,omitempty"`
+func (cs *CloudStore) indexChunkSessions(ctx context.Context, project string, payload []byte) error {
+	return cs.indexChunkSessionsWith(ctx, cs.db, project, payload)
 }
 
-// ContributorStats returns per-user statistics across the whole system.
-// This is an admin/org-level query (Phase 7).
-func (cs *CloudStore) ContributorStats() ([]ContributorStat, error) {
-	rows, err := cs.db.Query(`
-		SELECT
-			u.id, u.username, u.email,
-			COALESCE(s.cnt, 0),
-			COALESCE(o.cnt, 0),
-			GREATEST(s.last_session, o.last_obs) AS last_sync
-		FROM cloud_users u
-		LEFT JOIN (
-			SELECT user_id, COUNT(*) AS cnt, MAX(started_at) AS last_session
-			FROM cloud_sessions GROUP BY user_id
-		) s ON s.user_id = u.id
-		LEFT JOIN (
-			SELECT user_id, COUNT(*) AS cnt, MAX(created_at) AS last_obs
-			FROM cloud_observations WHERE deleted_at IS NULL GROUP BY user_id
-		) o ON o.user_id = u.id
-		ORDER BY last_sync DESC NULLS LAST
-	`)
+type chunkSessionIndexer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func (cs *CloudStore) indexChunkSessionsWith(ctx context.Context, execer chunkSessionIndexer, project string, payload []byte) error {
+	sessionIDs := collectSessionIDsFromPayload(payload)
+	if len(sessionIDs) == 0 {
+		return nil
+	}
+	for sessionID := range sessionIDs {
+		if _, err := execer.ExecContext(ctx,
+			`INSERT INTO cloud_project_sessions (project_name, session_id) VALUES ($1, $2) ON CONFLICT (project_name, session_id) DO NOTHING`,
+			project, sessionID,
+		); err != nil {
+			return fmt.Errorf("cloudstore: index session %q: %w", sessionID, err)
+		}
+	}
+	return nil
+}
+
+func materializedChunkMutations(project string, chunk engramsync.ChunkData) ([]MutationEntry, error) {
+	project = strings.TrimSpace(project)
+	entries := make([]MutationEntry, 0, len(chunk.Sessions)+len(chunk.Observations)+len(chunk.Prompts))
+
+	for i, session := range chunk.Sessions {
+		entityKey := strings.TrimSpace(session.ID)
+		if entityKey == "" {
+			return nil, fmt.Errorf("cloudstore: materialize chunk: sessions[%d].id is required", i)
+		}
+		payload, err := json.Marshal(session)
+		if err != nil {
+			return nil, fmt.Errorf("cloudstore: materialize chunk session %q: %w", entityKey, err)
+		}
+		entries = append(entries, MutationEntry{Project: project, Entity: store.SyncEntitySession, EntityKey: entityKey, Op: store.SyncOpUpsert, Payload: payload})
+	}
+
+	for i, observation := range chunk.Observations {
+		entityKey := strings.TrimSpace(observation.SyncID)
+		if entityKey == "" {
+			return nil, fmt.Errorf("cloudstore: materialize chunk: observations[%d].sync_id is required", i)
+		}
+		payload, err := json.Marshal(observation)
+		if err != nil {
+			return nil, fmt.Errorf("cloudstore: materialize chunk observation %q: %w", entityKey, err)
+		}
+		entries = append(entries, MutationEntry{Project: project, Entity: store.SyncEntityObservation, EntityKey: entityKey, Op: store.SyncOpUpsert, Payload: payload})
+	}
+
+	for i, prompt := range chunk.Prompts {
+		entityKey := strings.TrimSpace(prompt.SyncID)
+		if entityKey == "" {
+			return nil, fmt.Errorf("cloudstore: materialize chunk: prompts[%d].sync_id is required", i)
+		}
+		payload, err := json.Marshal(prompt)
+		if err != nil {
+			return nil, fmt.Errorf("cloudstore: materialize chunk prompt %q: %w", entityKey, err)
+		}
+		entries = append(entries, MutationEntry{Project: project, Entity: store.SyncEntityPrompt, EntityKey: entityKey, Op: store.SyncOpUpsert, Payload: payload})
+	}
+
+	return entries, nil
+}
+
+func insertMaterializedMutations(ctx context.Context, tx *sql.Tx, entries []MutationEntry) error {
+	for _, entry := range entries {
+		payload := entry.Payload
+		if len(payload) == 0 {
+			payload = json.RawMessage("{}")
+		}
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO cloud_mutations (project, entity, entity_key, op, payload)
+			VALUES ($1, $2, $3, $4, $5)`,
+			strings.TrimSpace(entry.Project), strings.TrimSpace(entry.Entity), strings.TrimSpace(entry.EntityKey), strings.TrimSpace(entry.Op), payload,
+		)
+		if err != nil {
+			return fmt.Errorf("cloudstore: insert materialized chunk mutation %s/%s/%s: %w", entry.Project, entry.Entity, entry.EntityKey, err)
+		}
+	}
+	return nil
+}
+
+func (cs *CloudStore) backfillProjectSessionsFromChunks(ctx context.Context) error {
+	rows, err := cs.db.QueryContext(ctx, `SELECT project_name, payload FROM cloud_chunks`)
 	if err != nil {
-		return nil, fmt.Errorf("cloudstore: contributor stats: %w", err)
+		return fmt.Errorf("cloudstore: backfill session index: %w", err)
 	}
 	defer rows.Close()
 
-	var results []ContributorStat
 	for rows.Next() {
-		var c ContributorStat
-		if err := rows.Scan(&c.UserID, &c.Username, &c.Email, &c.SessionCount, &c.ObservationCount, &c.LastSync); err != nil {
-			return nil, fmt.Errorf("cloudstore: scan contributor stat: %w", err)
+		var project string
+		var payload []byte
+		if err := rows.Scan(&project, &payload); err != nil {
+			return fmt.Errorf("cloudstore: backfill session index scan: %w", err)
 		}
-		results = append(results, c)
+		if err := cs.indexChunkSessions(ctx, project, payload); err != nil {
+			return fmt.Errorf("cloudstore: backfill session index row: %w", err)
+		}
 	}
-	if results == nil {
-		results = []ContributorStat{}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("cloudstore: backfill session index iterate: %w", err)
 	}
-	return results, rows.Err()
+	return nil
 }
 
-// ListAllUsers returns all registered users with their API key status.
-// Used by the admin user management view (Phase 8).
-func (cs *CloudStore) ListAllUsers() ([]CloudUser, error) {
-	rows, err := cs.db.Query(`
-		SELECT id, username, email, password_hash, api_key_hash, created_at, updated_at
-		FROM cloud_users
-		ORDER BY created_at DESC
-	`)
+func collectSessionIDsFromPayload(payload []byte) map[string]struct{} {
+	chunk, err := parseChunkData(payload)
 	if err != nil {
-		return nil, fmt.Errorf("cloudstore: list all users: %w", err)
+		return map[string]struct{}{}
 	}
-	defer rows.Close()
+	return collectSessionIDs(chunk)
+}
 
-	var results []CloudUser
-	for rows.Next() {
-		var u CloudUser
-		if err := rows.Scan(&u.ID, &u.Username, &u.Email, &u.PasswordHash, &u.APIKeyHash, &u.CreatedAt, &u.UpdatedAt); err != nil {
-			return nil, fmt.Errorf("cloudstore: scan user: %w", err)
+func parseChunkData(payload []byte) (engramsync.ChunkData, error) {
+	var chunk engramsync.ChunkData
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		return engramsync.ChunkData{}, err
+	}
+	return chunk, nil
+}
+
+func collectSessionIDs(chunk engramsync.ChunkData) map[string]struct{} {
+	sessionIDs := make(map[string]struct{})
+	for _, session := range chunk.Sessions {
+		sessionID := strings.TrimSpace(session.ID)
+		if sessionID != "" {
+			sessionIDs[sessionID] = struct{}{}
 		}
-		results = append(results, u)
 	}
-	if results == nil {
-		results = []CloudUser{}
+	for _, mutation := range chunk.Mutations {
+		if mutation.Entity != "session" || mutation.Op == "delete" {
+			continue
+		}
+		mutationPayload := strings.TrimSpace(mutation.Payload)
+		if mutationPayload == "" {
+			continue
+		}
+		var body struct {
+			ID string `json:"id"`
+		}
+		if err := chunkcodec.DecodeSyncMutationPayload(mutationPayload, &body); err != nil {
+			continue
+		}
+		sessionID := strings.TrimSpace(body.ID)
+		if sessionID != "" {
+			sessionIDs[sessionID] = struct{}{}
+		}
 	}
-	return results, rows.Err()
+	return sessionIDs
 }
 
-// SystemHealthInfo holds system health metrics for admin views.
-type SystemHealthInfo struct {
-	DBConnected    bool   `json:"db_connected"`
-	TotalUsers     int    `json:"total_users"`
-	TotalSessions  int    `json:"total_sessions"`
-	TotalMemories  int    `json:"total_memories"`
-	TotalPrompts   int    `json:"total_prompts"`
-	TotalMutations int    `json:"total_mutations"`
-	DBVersion      string `json:"db_version"`
-}
-
-// SystemHealth returns system-wide health metrics for admin views (Phase 8).
-func (cs *CloudStore) SystemHealth() (*SystemHealthInfo, error) {
-	h := &SystemHealthInfo{}
-
-	if err := cs.db.Ping(); err != nil {
-		h.DBConnected = false
-		return h, nil
+func (cs *CloudStore) resolveChunkConflict(ctx context.Context, project, chunkID string, payload []byte) error {
+	var existingPayload []byte
+	err := cs.db.QueryRowContext(ctx, `SELECT payload::text FROM cloud_chunks WHERE project_name = $1 AND chunk_id = $2`, project, chunkID).Scan(&existingPayload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: existing chunk %q was concurrently inserted", ErrChunkConflict, chunkID)
 	}
-	h.DBConnected = true
-
-	cs.db.QueryRow(`SELECT COUNT(*) FROM cloud_users`).Scan(&h.TotalUsers)
-	cs.db.QueryRow(`SELECT COUNT(*) FROM cloud_sessions`).Scan(&h.TotalSessions)
-	cs.db.QueryRow(`SELECT COUNT(*) FROM cloud_observations WHERE deleted_at IS NULL`).Scan(&h.TotalMemories)
-	cs.db.QueryRow(`SELECT COUNT(*) FROM cloud_prompts`).Scan(&h.TotalPrompts)
-	cs.db.QueryRow(`SELECT COUNT(*) FROM cloud_mutations`).Scan(&h.TotalMutations)
-	cs.db.QueryRow(`SELECT version()`).Scan(&h.DBVersion)
-
-	return h, nil
-}
-
-// UserProjects returns distinct project names for a user.
-func (cs *CloudStore) UserProjects(userID string) ([]string, error) {
-	rows, err := cs.db.Query(`
-		SELECT DISTINCT COALESCE(project, '') AS project
-		FROM cloud_observations
-		WHERE user_id = $1 AND deleted_at IS NULL AND project IS NOT NULL AND project != ''
-		UNION
-		SELECT DISTINCT project FROM cloud_sessions
-		WHERE user_id = $1 AND project != ''
-		ORDER BY project
-	`, userID)
 	if err != nil {
-		return nil, fmt.Errorf("cloudstore: user projects: %w", err)
+		return fmt.Errorf("cloudstore: resolve chunk conflict: %w", err)
 	}
-	defer rows.Close()
-
-	var results []string
-	for rows.Next() {
-		var p string
-		if err := rows.Scan(&p); err != nil {
-			return nil, fmt.Errorf("cloudstore: scan project: %w", err)
-		}
-		results = append(results, p)
+	normalizedIncoming := normalizeJSON(payload)
+	normalizedExisting := normalizeJSON(existingPayload)
+	if string(normalizedIncoming) == string(normalizedExisting) {
+		return nil
 	}
-	if results == nil {
-		results = []string{}
-	}
-	return results, rows.Err()
+	return fmt.Errorf("%w: existing chunk %q has different payload", ErrChunkConflict, chunkID)
 }
 
-// ─── Mutations (append-only per-user ledger for sync) ───────────────────
+func isUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return pgErr.Code == "23505"
+}
 
-// CloudMutation represents a single append-only mutation in the cloud ledger.
-type CloudMutation struct {
+func (cs *CloudStore) ReadChunk(ctx context.Context, project, chunkID string) ([]byte, error) {
+	if cs == nil || cs.db == nil {
+		return nil, fmt.Errorf("cloudstore: not initialized")
+	}
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return nil, fmt.Errorf("cloudstore: project is required")
+	}
+	var payload []byte
+	err := cs.db.QueryRowContext(ctx, `SELECT payload FROM cloud_chunks WHERE project_name = $1 AND chunk_id = $2`, project, strings.TrimSpace(chunkID)).Scan(&payload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: %q", ErrChunkNotFound, chunkID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("cloudstore: read chunk: %w", err)
+	}
+	return payload, nil
+}
+
+func (cs *CloudStore) migrate(ctx context.Context) error {
+	queries := []string{
+		`CREATE TABLE IF NOT EXISTS cloud_users (
+			id BIGSERIAL PRIMARY KEY,
+			username TEXT UNIQUE NOT NULL,
+			email TEXT UNIQUE NOT NULL,
+			password_hash TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE TABLE IF NOT EXISTS cloud_chunks (
+			project_name TEXT NOT NULL DEFAULT 'default',
+			chunk_id TEXT NOT NULL,
+			created_by TEXT NOT NULL,
+			client_created_at TIMESTAMPTZ,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			payload JSONB NOT NULL,
+			sessions_count INTEGER NOT NULL DEFAULT 0,
+			observations_count INTEGER NOT NULL DEFAULT 0,
+			prompts_count INTEGER NOT NULL DEFAULT 0
+		)`,
+		`ALTER TABLE cloud_chunks ADD COLUMN IF NOT EXISTS project_name TEXT`,
+		`ALTER TABLE cloud_chunks ADD COLUMN IF NOT EXISTS client_created_at TIMESTAMPTZ`,
+		`ALTER TABLE cloud_chunks ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()`,
+		`ALTER TABLE cloud_chunks ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb`,
+		`ALTER TABLE cloud_chunks ADD COLUMN IF NOT EXISTS sessions_count INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE cloud_chunks ADD COLUMN IF NOT EXISTS observations_count INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE cloud_chunks ADD COLUMN IF NOT EXISTS prompts_count INTEGER NOT NULL DEFAULT 0`,
+		`DO $$ BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = current_schema() AND table_name = 'cloud_chunks' AND column_name = 'imported_at'
+			) THEN
+				EXECUTE 'UPDATE cloud_chunks SET created_at = imported_at WHERE imported_at IS NOT NULL AND created_at IS NULL';
+			END IF;
+		END $$`,
+		`DO $$ BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = current_schema() AND table_name = 'cloud_chunks' AND column_name = 'sessions'
+			) THEN
+				EXECUTE 'UPDATE cloud_chunks SET sessions_count = sessions WHERE sessions_count = 0 AND sessions IS NOT NULL';
+			END IF;
+		END $$`,
+		`DO $$ BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = current_schema() AND table_name = 'cloud_chunks' AND column_name = 'memories'
+			) THEN
+				EXECUTE 'UPDATE cloud_chunks SET observations_count = memories WHERE observations_count = 0 AND memories IS NOT NULL';
+			END IF;
+		END $$`,
+		`DO $$ BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = current_schema() AND table_name = 'cloud_chunks' AND column_name = 'prompts'
+			) THEN
+				EXECUTE 'UPDATE cloud_chunks SET prompts_count = prompts WHERE prompts_count = 0 AND prompts IS NOT NULL';
+			END IF;
+		END $$`,
+		`DO $$ BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = current_schema() AND table_name = 'cloud_chunks' AND column_name = 'user_id'
+			) THEN
+				ALTER TABLE cloud_chunks ALTER COLUMN user_id DROP NOT NULL;
+			END IF;
+		END $$`,
+		`UPDATE cloud_chunks SET project_name = 'default' WHERE project_name IS NULL OR btrim(project_name) = ''`,
+		`ALTER TABLE cloud_chunks ALTER COLUMN project_name SET NOT NULL`,
+		`DO $$ BEGIN
+			IF EXISTS (
+				SELECT 1 FROM pg_constraint
+				WHERE conname = 'cloud_chunks_pkey' AND conrelid = 'cloud_chunks'::regclass
+			) THEN
+				ALTER TABLE cloud_chunks DROP CONSTRAINT cloud_chunks_pkey;
+			END IF;
+		END $$`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS cloud_chunks_project_chunk_uidx ON cloud_chunks (project_name, chunk_id)`,
+		`CREATE TABLE IF NOT EXISTS cloud_project_sessions (
+			project_name TEXT NOT NULL,
+			session_id TEXT NOT NULL,
+			indexed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (project_name, session_id)
+		)`,
+		`INSERT INTO cloud_project_sessions (project_name, session_id)
+		 SELECT c.project_name, btrim(elem->>'id')
+		 FROM cloud_chunks c,
+		      jsonb_array_elements(COALESCE(c.payload->'sessions', '[]'::jsonb)) AS elem
+		 WHERE btrim(COALESCE(elem->>'id', '')) <> ''
+		 ON CONFLICT (project_name, session_id) DO NOTHING`,
+		`CREATE TABLE IF NOT EXISTS cloud_project_controls (
+		    project       TEXT PRIMARY KEY,
+		    sync_enabled  BOOLEAN NOT NULL DEFAULT TRUE,
+		    paused_reason TEXT,
+		    updated_by    TEXT,
+		    updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`DO $$ BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = current_schema()
+				  AND table_name = 'cloud_project_controls'
+				  AND column_name = 'updated_by'
+				  AND udt_name = 'uuid'
+			) THEN
+				ALTER TABLE cloud_project_controls DROP CONSTRAINT IF EXISTS cloud_project_controls_updated_by_fkey;
+				ALTER TABLE cloud_project_controls ALTER COLUMN updated_by TYPE TEXT USING updated_by::text;
+			END IF;
+		END $$`,
+		`CREATE INDEX IF NOT EXISTS idx_cloud_project_controls_enabled ON cloud_project_controls(sync_enabled)`,
+		// cloud_mutations: journal for fine-grained mutation sync (REQ-200, REQ-201).
+		`CREATE TABLE IF NOT EXISTS cloud_mutations (
+			seq        BIGSERIAL PRIMARY KEY,
+			project    TEXT NOT NULL,
+			entity     TEXT NOT NULL,
+			entity_key TEXT NOT NULL,
+			op         TEXT NOT NULL,
+			payload    JSONB NOT NULL DEFAULT '{}',
+			occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`ALTER TABLE cloud_mutations ADD COLUMN IF NOT EXISTS project TEXT`,
+		`UPDATE cloud_mutations SET project = 'default' WHERE project IS NULL OR btrim(project) = ''`,
+		`ALTER TABLE cloud_mutations ALTER COLUMN project SET NOT NULL`,
+		`DO $$ BEGIN
+			IF EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = current_schema() AND table_name = 'cloud_mutations' AND column_name = 'user_id'
+			) THEN
+				ALTER TABLE cloud_mutations ALTER COLUMN user_id DROP NOT NULL;
+			END IF;
+		END $$`,
+		`CREATE INDEX IF NOT EXISTS idx_cloud_mutations_project ON cloud_mutations(project)`,
+		`CREATE INDEX IF NOT EXISTS idx_cloud_mutations_seq ON cloud_mutations(seq)`,
+		// cloud_sync_audit_log: persistent audit trail for push-rejection events (REQ-400).
+		`CREATE TABLE IF NOT EXISTS cloud_sync_audit_log (
+			id           SERIAL PRIMARY KEY,
+			occurred_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			contributor  TEXT NOT NULL,
+			project      TEXT NOT NULL,
+			action       TEXT NOT NULL,
+			outcome      TEXT NOT NULL,
+			entry_count  INT NOT NULL DEFAULT 0,
+			reason_code  TEXT,
+			metadata     JSONB
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_log_occurred_at ON cloud_sync_audit_log (occurred_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_log_contributor_project ON cloud_sync_audit_log (contributor, project)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_log_outcome ON cloud_sync_audit_log (outcome)`,
+	}
+	for _, q := range queries {
+		if _, err := cs.db.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("cloudstore: migrate: %w", err)
+		}
+	}
+	if err := cs.backfillProjectSessionsFromChunks(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// ─── Mutation Journal Queries ─────────────────────────────────────────────────
+
+// MutationEntry mirrors cloudserver.MutationEntry to avoid a circular import.
+type MutationEntry struct {
+	Project   string          `json:"project"`
+	Entity    string          `json:"entity"`
+	EntityKey string          `json:"entity_key"`
+	Op        string          `json:"op"`
+	Payload   json.RawMessage `json:"payload"`
+}
+
+// StoredMutation mirrors cloudserver.StoredMutation to avoid a circular import.
+type StoredMutation struct {
 	Seq        int64           `json:"seq"`
-	UserID     string          `json:"user_id"`
+	Project    string          `json:"project"`
 	Entity     string          `json:"entity"`
 	EntityKey  string          `json:"entity_key"`
 	Op         string          `json:"op"`
@@ -1037,345 +702,540 @@ type CloudMutation struct {
 	OccurredAt string          `json:"occurred_at"`
 }
 
-// PushMutationsRequest holds the JSON body for POST /sync/mutations/push.
-type PushMutationsRequest struct {
-	Mutations []PushMutationEntry `json:"mutations"`
+type MutationChunkBackfillReport struct {
+	Project             string `json:"project"`
+	Applied             bool   `json:"applied"`
+	CandidateMutations  int    `json:"candidate_mutations"`
+	AlreadyMaterialized int    `json:"already_materialized"`
+	InvalidMutations    int    `json:"invalid_mutations"`
+	ChunksPlanned       int    `json:"chunks_planned"`
+	ChunksInserted      int    `json:"chunks_inserted"`
 }
 
-// PushMutationEntry is a single mutation in a push request.
-// The shape mirrors the local sync_mutations.payload contract.
-type PushMutationEntry struct {
-	Entity    string          `json:"entity"`
-	EntityKey string          `json:"entity_key"`
-	Op        string          `json:"op"`
-	Payload   json.RawMessage `json:"payload"`
-}
-
-// PushMutationsResult holds the response for a mutation push.
-type PushMutationsResult struct {
-	Accepted int   `json:"accepted"`
-	LastSeq  int64 `json:"last_seq"`
-}
-
-// PullMutationsResult holds the response for a mutation pull.
-type PullMutationsResult struct {
-	Mutations []CloudMutation `json:"mutations"`
-	HasMore   bool            `json:"has_more"`
-}
-
-// AppendMutation inserts a mutation into the cloud ledger for a user.
-// Returns the assigned sequence number.
-func (cs *CloudStore) AppendMutation(userID, entity, entityKey, op string, payload json.RawMessage) (int64, error) {
-	var seq int64
-	err := cs.db.QueryRow(
-		`INSERT INTO cloud_mutations (user_id, entity, entity_key, op, payload)
-		 VALUES ($1, $2, $3, $4, $5)
-		 RETURNING seq`,
-		userID, entity, entityKey, op, payload,
-	).Scan(&seq)
+// InsertMutationBatch inserts a batch of mutations into the cloud_mutations journal.
+// Returns the sequence numbers assigned to each entry.
+// BW3: The entire batch is wrapped in a transaction — partial failures roll back
+// all prior entries so the client can retry the full batch without creating duplicates.
+func (cs *CloudStore) InsertMutationBatch(ctx context.Context, batch []MutationEntry) ([]int64, error) {
+	if cs == nil || cs.db == nil {
+		return nil, fmt.Errorf("cloudstore: not initialized")
+	}
+	if len(batch) == 0 {
+		return []int64{}, nil
+	}
+	chunks, err := materializedMutationBatchChunks(batch)
 	if err != nil {
-		return 0, fmt.Errorf("cloudstore: append mutation: %w", err)
+		return nil, err
 	}
-	return seq, nil
-}
 
-// AppendMutationBatch inserts multiple mutations atomically.
-// Returns the number accepted and the last assigned sequence.
-func (cs *CloudStore) AppendMutationBatch(userID string, entries []PushMutationEntry) (*PushMutationsResult, error) {
-	if len(entries) == 0 {
-		return &PushMutationsResult{}, nil
+	tx, err := cs.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("cloudstore: begin mutation batch tx: %w", err)
 	}
-	for _, e := range entries {
-		if err := cs.ensureProjectSyncEnabled(e.Entity, e.Payload); err != nil {
-			return nil, err
+	// Ensure rollback on any error path.
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback()
 		}
-	}
-	tx, err := cs.db.Begin()
-	if err != nil {
-		return nil, fmt.Errorf("cloudstore: begin mutation batch: %w", err)
-	}
-	defer tx.Rollback()
+	}()
 
-	var lastSeq int64
-	accepted := 0
-	for _, e := range entries {
-		err := tx.QueryRow(
-			`INSERT INTO cloud_mutations (user_id, entity, entity_key, op, payload)
-			 VALUES ($1, $2, $3, $4, $5)
-			 RETURNING seq`,
-			userID, e.Entity, e.EntityKey, e.Op, e.Payload,
-		).Scan(&lastSeq)
+	seqs := make([]int64, 0, len(batch))
+	for _, entry := range batch {
+		project := strings.TrimSpace(entry.Project)
+		entity := strings.TrimSpace(entry.Entity)
+		entityKey := strings.TrimSpace(entry.EntityKey)
+		op := strings.TrimSpace(entry.Op)
+		payload := entry.Payload
+		if len(payload) == 0 {
+			payload = json.RawMessage("{}")
+		}
+		var seq int64
+		err := tx.QueryRowContext(ctx, `
+			INSERT INTO cloud_mutations (project, entity, entity_key, op, payload)
+			VALUES ($1, $2, $3, $4, $5)
+			RETURNING seq`,
+			project, entity, entityKey, op, payload,
+		).Scan(&seq)
 		if err != nil {
 			return nil, fmt.Errorf("cloudstore: insert mutation: %w", err)
 		}
-		accepted++
+		seqs = append(seqs, seq)
+	}
+	for _, chunk := range chunks {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO cloud_chunks (project_name, chunk_id, created_by, payload, sessions_count, observations_count, prompts_count)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (project_name, chunk_id) DO NOTHING`,
+			chunk.project, chunk.id, "mutation-push", chunk.payload, chunk.counts.sessions, chunk.counts.observations, chunk.counts.prompts,
+		); err != nil {
+			return nil, fmt.Errorf("cloudstore: materialize mutation batch chunk: %w", err)
+		}
+		if err := cs.indexChunkSessionsWith(ctx, tx, chunk.project, chunk.payload); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("cloudstore: commit mutation batch: %w", err)
 	}
-	return &PushMutationsResult{Accepted: accepted, LastSeq: lastSeq}, nil
+	tx = nil // mark committed so deferred Rollback is a no-op
+	if len(chunks) > 0 {
+		cs.invalidateDashboardReadModel()
+	}
+	return seqs, nil
 }
 
-// PullMutations returns mutations for a user with seq > sinceSeq, ordered ASC.
-func (cs *CloudStore) PullMutations(userID string, sinceSeq int64, limit int) (*PullMutationsResult, error) {
-	if limit <= 0 {
-		limit = 100
+const mutationBackfillChunkSize = 100
+
+func (cs *CloudStore) BackfillMutationChunks(ctx context.Context, project string, apply bool) (MutationChunkBackfillReport, error) {
+	if cs == nil || cs.db == nil {
+		return MutationChunkBackfillReport{}, fmt.Errorf("cloudstore: not initialized")
 	}
-	var mutations []CloudMutation
-	lastSeq := sinceSeq
-	hasMore := false
-	for len(mutations) < limit+1 {
-		rows, err := cs.db.Query(
-			`SELECT seq, user_id, entity, entity_key, op, payload, occurred_at
-			 FROM cloud_mutations
-			 WHERE user_id = $1 AND seq > $2
-			 ORDER BY seq ASC
-			 LIMIT $3`,
-			userID, lastSeq, limit+1,
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return MutationChunkBackfillReport{}, fmt.Errorf("cloudstore: project is required")
+	}
+
+	report := MutationChunkBackfillReport{Project: project, Applied: apply}
+	materialized, err := cs.existingChunkMutationSignatures(ctx, project)
+	if err != nil {
+		return MutationChunkBackfillReport{}, err
+	}
+
+	rows, err := cs.db.QueryContext(ctx, `
+		SELECT project, entity, entity_key, op, payload::text
+		FROM cloud_mutations
+		WHERE project = $1
+		ORDER BY seq ASC`, project)
+	if err != nil {
+		return MutationChunkBackfillReport{}, fmt.Errorf("cloudstore: query mutation chunk backfill candidates: %w", err)
+	}
+	defer rows.Close()
+
+	missing := make([]MutationEntry, 0)
+	for rows.Next() {
+		var entry MutationEntry
+		var payload string
+		if err := rows.Scan(&entry.Project, &entry.Entity, &entry.EntityKey, &entry.Op, &payload); err != nil {
+			return MutationChunkBackfillReport{}, fmt.Errorf("cloudstore: scan mutation chunk backfill candidate: %w", err)
+		}
+		if !isChunkMaterializableMutationEntity(entry.Entity) {
+			continue
+		}
+		entry.Payload = json.RawMessage(payload)
+		report.CandidateMutations++
+		sig, err := mutationEntrySignature(entry)
+		if err != nil {
+			report.InvalidMutations++
+			continue
+		}
+		if _, ok := materialized[sig]; ok {
+			report.AlreadyMaterialized++
+			continue
+		}
+		missing = append(missing, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return MutationChunkBackfillReport{}, fmt.Errorf("cloudstore: iterate mutation chunk backfill candidates: %w", err)
+	}
+
+	chunks := make([]materializedMutationChunk, 0)
+	for start := 0; start < len(missing); start += mutationBackfillChunkSize {
+		end := start + mutationBackfillChunkSize
+		if end > len(missing) {
+			end = len(missing)
+		}
+		batchChunks, err := materializedMutationBatchChunks(missing[start:end])
+		if err != nil {
+			return MutationChunkBackfillReport{}, err
+		}
+		chunks = append(chunks, batchChunks...)
+	}
+	report.ChunksPlanned = len(chunks)
+	if !apply || len(chunks) == 0 {
+		return report, nil
+	}
+
+	tx, err := cs.db.BeginTx(ctx, nil)
+	if err != nil {
+		return MutationChunkBackfillReport{}, fmt.Errorf("cloudstore: begin mutation chunk backfill tx: %w", err)
+	}
+	defer func() {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+	}()
+	for _, chunk := range chunks {
+		result, err := tx.ExecContext(ctx, `
+			INSERT INTO cloud_chunks (project_name, chunk_id, created_by, payload, sessions_count, observations_count, prompts_count)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			ON CONFLICT (project_name, chunk_id) DO NOTHING`,
+			chunk.project, chunk.id, "mutation-backfill", chunk.payload, chunk.counts.sessions, chunk.counts.observations, chunk.counts.prompts,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("cloudstore: pull mutations: %w", err)
+			return MutationChunkBackfillReport{}, fmt.Errorf("cloudstore: insert mutation chunk backfill: %w", err)
 		}
+		if affected, err := result.RowsAffected(); err == nil && affected > 0 {
+			report.ChunksInserted++
+		}
+		if err := cs.indexChunkSessionsWith(ctx, tx, chunk.project, chunk.payload); err != nil {
+			return MutationChunkBackfillReport{}, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return MutationChunkBackfillReport{}, fmt.Errorf("cloudstore: commit mutation chunk backfill: %w", err)
+	}
+	tx = nil
+	if report.ChunksInserted > 0 {
+		cs.invalidateDashboardReadModel()
+	}
+	return report, nil
+}
 
-		fetched := 0
-		for rows.Next() {
-			fetched++
-			var m CloudMutation
-			if err := rows.Scan(&m.Seq, &m.UserID, &m.Entity, &m.EntityKey, &m.Op, &m.Payload, &m.OccurredAt); err != nil {
-				rows.Close()
-				return nil, fmt.Errorf("cloudstore: scan mutation: %w", err)
-			}
-			lastSeq = m.Seq
-			project, err := projectFromMutation(m.Entity, m.Payload)
-			if err != nil {
-				rows.Close()
-				return nil, fmt.Errorf("cloudstore: pull project from mutation: %w", err)
-			}
-			enabled, err := cs.IsProjectSyncEnabled(project)
-			if err != nil {
-				rows.Close()
-				return nil, err
-			}
-			if !enabled {
+func (cs *CloudStore) existingChunkMutationSignatures(ctx context.Context, project string) (map[string]struct{}, error) {
+	rows, err := cs.db.QueryContext(ctx, `SELECT payload FROM cloud_chunks WHERE project_name = $1`, project)
+	if err != nil {
+		return nil, fmt.Errorf("cloudstore: query existing chunk mutations: %w", err)
+	}
+	defer rows.Close()
+
+	signatures := make(map[string]struct{})
+	for rows.Next() {
+		var payload []byte
+		if err := rows.Scan(&payload); err != nil {
+			return nil, fmt.Errorf("cloudstore: scan existing chunk mutations: %w", err)
+		}
+		chunk, err := parseChunkData(payload)
+		if err != nil {
+			return nil, fmt.Errorf("cloudstore: parse existing chunk mutations: %w", err)
+		}
+		for _, mutation := range chunk.Mutations {
+			if !isChunkMaterializableMutationEntity(mutation.Entity) {
 				continue
 			}
-			mutations = append(mutations, m)
-			if len(mutations) > limit {
-				hasMore = true
-				break
+			sig, err := syncMutationSignature(mutation)
+			if err != nil {
+				return nil, fmt.Errorf("cloudstore: sign existing chunk mutation %s/%s/%s: %w", mutation.Project, mutation.Entity, mutation.EntityKey, err)
 			}
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return nil, fmt.Errorf("cloudstore: pull mutations rows: %w", err)
-		}
-		rows.Close()
-		if hasMore || fetched < limit+1 {
-			break
+			signatures[sig] = struct{}{}
 		}
 	}
-
-	if len(mutations) > limit {
-		mutations = mutations[:limit]
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("cloudstore: iterate existing chunk mutations: %w", err)
 	}
-	if mutations == nil {
-		mutations = []CloudMutation{}
-	}
-	return &PullMutationsResult{Mutations: mutations, HasMore: hasMore}, nil
+	return signatures, nil
 }
 
-// UpsertSessionByPayload applies a session upsert from a sync mutation payload.
-func (cs *CloudStore) UpsertSessionByPayload(userID string, payload json.RawMessage) error {
-	var p struct {
-		ID        string  `json:"id"`
-		Project   string  `json:"project"`
-		Directory string  `json:"directory"`
-		EndedAt   *string `json:"ended_at,omitempty"`
-		Summary   *string `json:"summary,omitempty"`
-	}
-	if err := decodeMutationPayload(payload, &p); err != nil {
-		return fmt.Errorf("cloudstore: unmarshal session payload: %w", err)
-	}
-	_, err := cs.db.Exec(
-		`INSERT INTO cloud_sessions (id, user_id, project, directory, ended_at, summary)
-		 VALUES ($1, $2, $3, $4, $5, $6)
-		 ON CONFLICT (user_id, id) DO UPDATE SET
-		   project   = EXCLUDED.project,
-		   directory = EXCLUDED.directory,
-		   ended_at  = COALESCE(EXCLUDED.ended_at, cloud_sessions.ended_at),
-		   summary   = COALESCE(EXCLUDED.summary, cloud_sessions.summary)`,
-		p.ID, userID, p.Project, p.Directory, p.EndedAt, p.Summary,
-	)
-	return err
+type materializedMutationChunk struct {
+	project string
+	id      string
+	payload []byte
+	counts  chunkSummary
 }
 
-// UpsertObservationByPayload applies an observation upsert from a sync mutation payload.
-// Uses sync_id as the stable cross-device identity for upserts.
-func (cs *CloudStore) UpsertObservationByPayload(userID string, payload json.RawMessage) error {
-	var p struct {
-		SyncID    string  `json:"sync_id"`
-		SessionID string  `json:"session_id"`
-		Type      string  `json:"type"`
-		Title     string  `json:"title"`
-		Content   string  `json:"content"`
-		ToolName  *string `json:"tool_name,omitempty"`
-		Project   *string `json:"project,omitempty"`
-		Scope     string  `json:"scope"`
-		TopicKey  *string `json:"topic_key,omitempty"`
+func materializedMutationBatchChunks(batch []MutationEntry) ([]materializedMutationChunk, error) {
+	if len(batch) == 0 {
+		return nil, nil
 	}
-	if err := decodeMutationPayload(payload, &p); err != nil {
-		return fmt.Errorf("cloudstore: unmarshal observation payload: %w", err)
-	}
-	scope := normalizeScope(p.Scope)
-	normHash := hashNormalized(p.Content)
-
-	// Try to find an existing observation by sync_id for this user.
-	var existingID int64
-	err := cs.db.QueryRow(
-		`SELECT id FROM cloud_observations
-		 WHERE user_id = $1 AND session_id = $2 AND normalized_hash IN (
-		   SELECT normalized_hash FROM cloud_observations WHERE user_id = $1
-		 )
-		 AND type = $3 AND title = $4
-		 ORDER BY id DESC LIMIT 1`,
-		userID, p.SessionID, p.Type, p.Title,
-	).Scan(&existingID)
-
-	// Simple approach: always upsert by looking for matching content, or insert new.
-	if err == sql.ErrNoRows || err != nil {
-		// Insert new
-		_, err = cs.db.Exec(
-			`INSERT INTO cloud_observations
-			 (user_id, session_id, type, title, content, tool_name, project, scope, topic_key, normalized_hash,
-			  revision_count, duplicate_count, last_seen_at, updated_at)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 1, 1, NOW(), NOW())`,
-			userID, p.SessionID, p.Type, p.Title, p.Content,
-			p.ToolName, p.Project, scope, p.TopicKey, normHash,
-		)
-		return err
-	}
-	// Update existing
-	_, err = cs.db.Exec(
-		`UPDATE cloud_observations
-		 SET type = $1, title = $2, content = $3, tool_name = $4, project = $5,
-		     scope = $6, topic_key = $7, normalized_hash = $8,
-		     revision_count = revision_count + 1, updated_at = NOW(), deleted_at = NULL
-		 WHERE id = $9 AND user_id = $10`,
-		p.Type, p.Title, p.Content, p.ToolName, p.Project, scope, p.TopicKey, normHash, existingID, userID,
-	)
-	return err
-}
-
-// DeleteObservationByPayload applies a soft/hard delete from a sync mutation payload.
-func (cs *CloudStore) DeleteObservationByPayload(userID string, payload json.RawMessage) error {
-	var p struct {
-		SyncID     string  `json:"sync_id"`
-		Deleted    bool    `json:"deleted"`
-		DeletedAt  *string `json:"deleted_at,omitempty"`
-		HardDelete bool    `json:"hard_delete"`
-	}
-	if err := decodeMutationPayload(payload, &p); err != nil {
-		return fmt.Errorf("cloudstore: unmarshal delete payload: %w", err)
-	}
-	// For the cloud side, we can't match by sync_id since the cloud schema
-	// doesn't have a sync_id column. The mutation itself carries the intent —
-	// the cloud simply records it in the ledger for pull by other devices.
-	// Direct cloud-side apply is optional; the ledger is the source of truth.
-	return nil
-}
-
-// UpsertPromptByPayload applies a prompt upsert from a sync mutation payload.
-func (cs *CloudStore) UpsertPromptByPayload(userID string, payload json.RawMessage) error {
-	var p struct {
-		SyncID    string  `json:"sync_id"`
-		SessionID string  `json:"session_id"`
-		Content   string  `json:"content"`
-		Project   *string `json:"project,omitempty"`
-	}
-	if err := decodeMutationPayload(payload, &p); err != nil {
-		return fmt.Errorf("cloudstore: unmarshal prompt payload: %w", err)
-	}
-	// Insert new prompt (prompts are append-only in the cloud schema).
-	_, err := cs.db.Exec(
-		`INSERT INTO cloud_prompts (user_id, session_id, content, project)
-		 VALUES ($1, $2, $3, $4)`,
-		userID, p.SessionID, p.Content, p.Project,
-	)
-	return err
-}
-
-// ApplyMutationPayload dispatches a mutation to the appropriate entity handler.
-// This enables the cloud to materialize pushed mutations into the relational tables.
-func (cs *CloudStore) ApplyMutationPayload(userID, entity, op string, payload json.RawMessage) error {
-	switch entity {
-	case "session":
-		return cs.UpsertSessionByPayload(userID, payload)
-	case "observation":
-		if op == "delete" {
-			return cs.DeleteObservationByPayload(userID, payload)
+	groups := make(map[string][]MutationEntry)
+	order := make([]string, 0)
+	for i, entry := range batch {
+		project := strings.TrimSpace(entry.Project)
+		if project == "" {
+			return nil, fmt.Errorf("cloudstore: materialize mutation batch: entries[%d].project is required", i)
 		}
-		return cs.UpsertObservationByPayload(userID, payload)
-	case "prompt":
-		return cs.UpsertPromptByPayload(userID, payload)
+		if _, ok := groups[project]; !ok {
+			order = append(order, project)
+		}
+		groups[project] = append(groups[project], entry)
+	}
+
+	chunks := make([]materializedMutationChunk, 0, len(order))
+	for _, project := range order {
+		payload, counts, err := materializedMutationBatchChunk(groups[project])
+		if err != nil {
+			return nil, err
+		}
+		if len(payload) == 0 {
+			continue
+		}
+		chunks = append(chunks, materializedMutationChunk{project: project, id: chunkIDFromPayload(payload), payload: payload, counts: counts})
+	}
+	return chunks, nil
+}
+
+func materializedMutationBatchChunk(batch []MutationEntry) ([]byte, chunkSummary, error) {
+	if len(batch) == 0 {
+		return nil, chunkSummary{}, nil
+	}
+	project := strings.TrimSpace(batch[0].Project)
+	chunk := engramsync.ChunkData{Mutations: make([]store.SyncMutation, 0, len(batch))}
+	for i, entry := range batch {
+		entryProject := strings.TrimSpace(entry.Project)
+		if entryProject == "" {
+			return nil, chunkSummary{}, fmt.Errorf("cloudstore: materialize mutation batch: entries[%d].project is required", i)
+		}
+		if project == "" {
+			project = entryProject
+		}
+		if entryProject != project {
+			return nil, chunkSummary{}, fmt.Errorf("cloudstore: materialize mutation batch: mixed projects %q and %q", project, entryProject)
+		}
+		entity := strings.TrimSpace(entry.Entity)
+		if !isChunkMaterializableMutationEntity(entity) {
+			continue
+		}
+
+		payload := entry.Payload
+		if len(payload) == 0 {
+			payload = json.RawMessage("{}")
+		}
+		chunk.Mutations = append(chunk.Mutations, store.SyncMutation{
+			Project:   entryProject,
+			Entity:    entity,
+			EntityKey: strings.TrimSpace(entry.EntityKey),
+			Op:        strings.TrimSpace(entry.Op),
+			Payload:   string(payload),
+		})
+
+		if strings.TrimSpace(entry.Op) != store.SyncOpUpsert {
+			continue
+		}
+		switch entity {
+		case store.SyncEntitySession:
+			var session store.Session
+			if err := json.Unmarshal(payload, &session); err != nil {
+				return nil, chunkSummary{}, fmt.Errorf("cloudstore: materialize mutation batch session %q: %w", entry.EntityKey, err)
+			}
+			if strings.TrimSpace(session.ID) == "" {
+				session.ID = strings.TrimSpace(entry.EntityKey)
+			}
+			chunk.Sessions = append(chunk.Sessions, session)
+		case store.SyncEntityObservation:
+			var observation store.Observation
+			if err := json.Unmarshal(payload, &observation); err != nil {
+				return nil, chunkSummary{}, fmt.Errorf("cloudstore: materialize mutation batch observation %q: %w", entry.EntityKey, err)
+			}
+			if strings.TrimSpace(observation.SyncID) == "" {
+				observation.SyncID = strings.TrimSpace(entry.EntityKey)
+			}
+			chunk.Observations = append(chunk.Observations, observation)
+		case store.SyncEntityPrompt:
+			var prompt store.Prompt
+			if err := json.Unmarshal(payload, &prompt); err != nil {
+				return nil, chunkSummary{}, fmt.Errorf("cloudstore: materialize mutation batch prompt %q: %w", entry.EntityKey, err)
+			}
+			if strings.TrimSpace(prompt.SyncID) == "" {
+				prompt.SyncID = strings.TrimSpace(entry.EntityKey)
+			}
+			chunk.Prompts = append(chunk.Prompts, prompt)
+		}
+	}
+	if len(chunk.Mutations) == 0 {
+		return nil, chunkSummary{}, nil
+	}
+
+	payload, err := json.Marshal(chunk)
+	if err != nil {
+		return nil, chunkSummary{}, fmt.Errorf("cloudstore: marshal materialized mutation batch chunk: %w", err)
+	}
+	payload, err = chunkcodec.CanonicalizeForProject(payload, project)
+	if err != nil {
+		return nil, chunkSummary{}, fmt.Errorf("cloudstore: canonicalize materialized mutation batch chunk: %w", err)
+	}
+	return payload, chunkSummary{sessions: len(chunk.Sessions), observations: len(chunk.Observations), prompts: len(chunk.Prompts)}, nil
+}
+
+func isChunkMaterializableMutationEntity(entity string) bool {
+	switch strings.TrimSpace(entity) {
+	case store.SyncEntitySession, store.SyncEntityObservation, store.SyncEntityPrompt:
+		return true
 	default:
-		return fmt.Errorf("cloudstore: unknown mutation entity %q", entity)
+		return false
 	}
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-// nullableString returns nil for empty strings, matching the local store pattern.
-func nullableString(s string) *string {
-	if s == "" {
-		return nil
+func mutationEntrySignature(entry MutationEntry) (string, error) {
+	project := strings.TrimSpace(entry.Project)
+	if project == "" {
+		return "", fmt.Errorf("project is required")
 	}
-	return &s
+	payload := entry.Payload
+	if len(payload) == 0 {
+		payload = json.RawMessage("{}")
+	}
+	doc := engramsync.ChunkData{Mutations: []store.SyncMutation{{
+		Project:   project,
+		Entity:    strings.TrimSpace(entry.Entity),
+		EntityKey: strings.TrimSpace(entry.EntityKey),
+		Op:        strings.TrimSpace(entry.Op),
+		Payload:   string(payload),
+	}}}
+	encoded, err := json.Marshal(doc)
+	if err != nil {
+		return "", err
+	}
+	canonical, err := chunkcodec.CanonicalizeForProject(encoded, project)
+	if err != nil {
+		return "", err
+	}
+	chunk, err := parseChunkData(canonical)
+	if err != nil {
+		return "", err
+	}
+	if len(chunk.Mutations) != 1 {
+		return "", fmt.Errorf("expected one canonical mutation, got %d", len(chunk.Mutations))
+	}
+	return syncMutationSignature(chunk.Mutations[0])
 }
 
-func decodeMutationPayload(payload json.RawMessage, dest any) error {
-	trimmed := strings.TrimSpace(string(payload))
+func syncMutationSignature(mutation store.SyncMutation) (string, error) {
+	normalized, err := canonicalMutationPayload([]byte(strings.TrimSpace(mutation.Payload)))
+	if err != nil {
+		return "", err
+	}
+	return strings.Join([]string{
+		strings.TrimSpace(mutation.Project),
+		strings.TrimSpace(mutation.Entity),
+		strings.TrimSpace(mutation.EntityKey),
+		strings.TrimSpace(mutation.Op),
+		normalized,
+	}, "\x00"), nil
+}
+
+func canonicalMutationPayload(payload []byte) (string, error) {
+	payload = normalizeJSON(payload)
+	if !json.Valid(payload) {
+		return "", fmt.Errorf("payload is not valid JSON")
+	}
+	return string(payload), nil
+}
+
+// ListMutationsSince returns mutations with seq > sinceSeq, filtered to allowedProjects.
+// If allowedProjects is nil, no project filter is applied (returns all).
+// If allowedProjects is non-nil (even empty), only those projects are returned.
+// Returns (mutations, hasMore, latestSeq, error).
+func (cs *CloudStore) ListMutationsSince(ctx context.Context, sinceSeq int64, limit int, allowedProjects []string) ([]StoredMutation, bool, int64, error) {
+	if cs == nil || cs.db == nil {
+		return nil, false, 0, fmt.Errorf("cloudstore: not initialized")
+	}
+	if limit <= 0 || limit > 100 {
+		limit = 100
+	}
+
+	// If allowedProjects is non-nil but empty, return empty result immediately.
+	if allowedProjects != nil && len(allowedProjects) == 0 {
+		return []StoredMutation{}, false, 0, nil
+	}
+
+	// Fetch limit+1 to detect hasMore.
+	fetchLimit := limit + 1
+
+	var rows *sql.Rows
+	var err error
+
+	if allowedProjects == nil {
+		// No enrollment filter.
+		rows, err = cs.db.QueryContext(ctx, `
+			SELECT seq, project, entity, entity_key, op, payload::text, occurred_at
+			FROM cloud_mutations
+			WHERE seq > $1
+			ORDER BY seq ASC
+			LIMIT $2`,
+			sinceSeq, fetchLimit,
+		)
+	} else {
+		// Filter by allowed projects.
+		rows, err = cs.db.QueryContext(ctx, `
+			SELECT seq, project, entity, entity_key, op, payload::text, occurred_at
+			FROM cloud_mutations
+			WHERE seq > $1 AND project = ANY($2)
+			ORDER BY seq ASC
+			LIMIT $3`,
+			sinceSeq, allowedProjects, fetchLimit,
+		)
+	}
+	if err != nil {
+		return nil, false, 0, fmt.Errorf("cloudstore: list mutations since %d: %w", sinceSeq, err)
+	}
+	defer rows.Close()
+
+	var all []StoredMutation
+	for rows.Next() {
+		var m StoredMutation
+		var payloadStr string
+		var occurredAt time.Time
+		if err := rows.Scan(&m.Seq, &m.Project, &m.Entity, &m.EntityKey, &m.Op, &payloadStr, &occurredAt); err != nil {
+			return nil, false, 0, fmt.Errorf("cloudstore: scan mutation: %w", err)
+		}
+		m.Payload = json.RawMessage(payloadStr)
+		m.OccurredAt = occurredAt.UTC().Format(time.RFC3339)
+		all = append(all, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, 0, fmt.Errorf("cloudstore: iterate mutations: %w", err)
+	}
+
+	hasMore := len(all) > limit
+	if hasMore {
+		all = all[:limit]
+	}
+
+	latestSeq := int64(0)
+	if len(all) > 0 {
+		latestSeq = all[len(all)-1].Seq
+	}
+
+	return all, hasMore, latestSeq, nil
+}
+
+func parseClientCreatedAt(value string) (*time.Time, error) {
+	trimmed := strings.TrimSpace(value)
 	if trimmed == "" {
-		return fmt.Errorf("empty payload")
+		return nil, nil
 	}
-	if trimmed[0] != '"' {
-		return json.Unmarshal([]byte(trimmed), dest)
+	parsed, err := time.Parse(time.RFC3339, trimmed)
+	if err != nil {
+		return nil, fmt.Errorf("cloudstore: invalid client_created_at: %w", err)
 	}
-	var encoded string
-	if err := json.Unmarshal([]byte(trimmed), &encoded); err != nil {
-		return err
-	}
-	return json.Unmarshal([]byte(encoded), dest)
+	parsed = parsed.UTC()
+	return &parsed, nil
 }
 
-// normalizeScope normalizes scope values, matching the local store pattern.
-func normalizeScope(scope string) string {
-	v := strings.TrimSpace(strings.ToLower(scope))
-	if v == "personal" {
-		return "personal"
-	}
-	if v == "global" {
-		return "global"
-	}
-	if v == "" {
-		return "project"
-	}
-	return v
+func chunkIDFromPayload(payload []byte) string {
+	return chunkcodec.ChunkID(payload)
 }
 
-// hashNormalized returns a SHA-256 hex digest of the content, matching
-// the local store's deduplication hash pattern.
-func hashNormalized(content string) string {
-	h := sha256.Sum256([]byte(strings.TrimSpace(strings.ToLower(content))))
-	return hex.EncodeToString(h[:])
+func normalizeJSON(payload []byte) []byte {
+	var body any
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return payload
+	}
+	normalized, err := json.Marshal(body)
+	if err != nil {
+		return payload
+	}
+	return normalized
 }
 
-// truncate truncates a string to max runes, appending "..." if needed.
-// Uses rune counting for valid UTF-8 (matching internal/store/store.go).
-func truncate(s string, max int) string {
-	if utf8.RuneCountInString(s) <= max {
-		return s
+type chunkSummary struct {
+	sessions     int
+	observations int
+	prompts      int
+}
+
+func summarizeChunk(payload []byte) chunkSummary {
+	var body struct {
+		Sessions     []json.RawMessage `json:"sessions"`
+		Observations []json.RawMessage `json:"observations"`
+		Prompts      []json.RawMessage `json:"prompts"`
 	}
-	runes := []rune(s)
-	return string(runes[:max]) + "..."
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return chunkSummary{}
+	}
+	return chunkSummary{
+		sessions:     len(body.Sessions),
+		observations: len(body.Observations),
+		prompts:      len(body.Prompts),
+	}
 }

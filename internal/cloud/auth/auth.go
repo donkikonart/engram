@@ -1,267 +1,257 @@
 package auth
 
 import (
-	"database/sql"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/Gentleman-Programming/engram/internal/cloud/cloudstore"
-	"github.com/golang-jwt/jwt/v5"
-	"golang.org/x/crypto/bcrypt"
+	"github.com/Gentleman-Programming/engram/internal/store"
 )
 
-// ─── Errors ──────────────────────────────────────────────────────────────────
+var ErrSecretTooShort = errors.New("jwt secret must be at least 32 bytes")
+var ErrBearerTokenNotConfigured = errors.New("cloud bearer token is not configured")
+var ErrInvalidDashboardSessionToken = errors.New("invalid dashboard session token")
+var ErrProjectNotAllowed = errors.New("project is not allowed for this token")
 
-var (
-	// ErrInvalidCredentials is returned for failed login attempts. The message
-	// is deliberately generic to avoid leaking whether the username exists.
-	ErrInvalidCredentials = errors.New("invalid credentials")
-
-	// ErrWeakPassword is returned when a password is shorter than 8 characters.
-	ErrWeakPassword = errors.New("password must be at least 8 characters")
-
-	// ErrSecretTooShort is returned when the JWT secret is shorter than 32 bytes.
-	ErrSecretTooShort = errors.New("jwt secret must be at least 32 bytes")
-
-	// ErrInvalidToken is returned for any token validation failure.
-	ErrInvalidToken = errors.New("invalid token")
-
-	// ErrTokenExpired is returned when a token has expired.
-	ErrTokenExpired = errors.New("token has expired")
-
-	// ErrWrongTokenType is returned when a token's type claim doesn't match expectations.
-	ErrWrongTokenType = errors.New("wrong token type")
-)
-
-// ─── Claims ──────────────────────────────────────────────────────────────────
-
-// Claims represents the custom JWT claims for Engram Cloud tokens.
-type Claims struct {
-	UserID   string `json:"user_id"`
-	Username string `json:"username"`
-	Type     string `json:"type"` // "access" or "refresh"
-	jwt.RegisteredClaims
-}
-
-// ─── AuthResult ──────────────────────────────────────────────────────────────
-
-// AuthResult is returned by Register and Login on success.
-type AuthResult struct {
-	UserID       string `json:"user_id"`
-	Username     string `json:"username"`
-	AccessToken  string `json:"access_token"`
-	RefreshToken string `json:"refresh_token"`
-	ExpiresIn    int    `json:"expires_in"` // seconds until access token expires
-}
-
-// ─── Service ─────────────────────────────────────────────────────────────────
-
-// Service handles JWT authentication and user registration/login for Engram Cloud.
 type Service struct {
-	secret []byte
-	store  *cloudstore.CloudStore
+	store         *cloudstore.CloudStore
+	expectedToken string
+	dashboardAuth map[string]struct{}
+	allowed       map[string]struct{}
+	jwtSecret     []byte
+	now           func() time.Time
 }
 
-// NewService creates a new auth Service. The jwtSecret MUST be at least 32 bytes.
+type ProjectScopeAuthorizer struct {
+	allowed map[string]struct{}
+}
+
 func NewService(store *cloudstore.CloudStore, jwtSecret string) (*Service, error) {
 	if len(jwtSecret) < 32 {
 		return nil, ErrSecretTooShort
 	}
-	return &Service{
-		secret: []byte(jwtSecret),
-		store:  store,
-	}, nil
+	return &Service{store: store, jwtSecret: []byte(jwtSecret), now: time.Now}, nil
 }
 
-// ─── Token Generation ────────────────────────────────────────────────────────
-
-// accessTokenExpiry is the lifetime of an access token.
-const accessTokenExpiry = 1 * time.Hour
-
-// refreshTokenExpiry is the lifetime of a refresh token.
-const refreshTokenExpiry = 7 * 24 * time.Hour
-
-// GenerateTokenPair creates an access token (1h) and refresh token (7d) for
-// the given user. Both are signed with HMAC-SHA256.
-func (s *Service) GenerateTokenPair(userID, username string) (accessToken, refreshToken string, err error) {
-	now := time.Now()
-
-	// Access token.
-	accessClaims := Claims{
-		UserID:   userID,
-		Username: username,
-		Type:     "access",
-		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   userID,
-			IssuedAt:  jwt.NewNumericDate(now),
-			ExpiresAt: jwt.NewNumericDate(now.Add(accessTokenExpiry)),
-		},
-	}
-	accessToken, err = jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims).SignedString(s.secret)
-	if err != nil {
-		return "", "", fmt.Errorf("auth: sign access token: %w", err)
-	}
-
-	// Refresh token.
-	refreshClaims := Claims{
-		UserID:   userID,
-		Username: username,
-		Type:     "refresh",
-		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   userID,
-			IssuedAt:  jwt.NewNumericDate(now),
-			ExpiresAt: jwt.NewNumericDate(now.Add(refreshTokenExpiry)),
-		},
-	}
-	refreshToken, err = jwt.NewWithClaims(jwt.SigningMethodHS256, refreshClaims).SignedString(s.secret)
-	if err != nil {
-		return "", "", fmt.Errorf("auth: sign refresh token: %w", err)
-	}
-
-	return accessToken, refreshToken, nil
+func NewProjectScopeAuthorizer(projects []string) *ProjectScopeAuthorizer {
+	a := &ProjectScopeAuthorizer{allowed: make(map[string]struct{})}
+	a.SetAllowedProjects(projects)
+	return a
 }
 
-// ─── Token Validation ────────────────────────────────────────────────────────
-
-// ValidateAccessToken parses and validates an access token string. It checks
-// the HMAC-SHA256 signature, expiry, and verifies that the token type is "access".
-func (s *Service) ValidateAccessToken(tokenStr string) (*Claims, error) {
-	claims, err := s.parseToken(tokenStr)
-	if err != nil {
-		return nil, err
-	}
-	if claims.Type != "access" {
-		return nil, ErrWrongTokenType
-	}
-	return claims, nil
+type dashboardSessionClaims struct {
+	TokenHash string `json:"token_hash"`
+	Exp       int64  `json:"exp"`
+	Iat       int64  `json:"iat"`
 }
 
-// RefreshAccessToken validates a refresh token and issues a new access token.
-// It verifies that the token type is "refresh", then generates a fresh access
-// token for the same user.
-func (s *Service) RefreshAccessToken(refreshTokenStr string) (newAccessToken string, err error) {
-	claims, err := s.parseToken(refreshTokenStr)
+// MintDashboardSession returns a signed dashboard session token.
+// The token is opaque to clients and validated by ParseDashboardSession.
+func (s *Service) MintDashboardSession(bearerToken string) (string, error) {
+	bearerToken = strings.TrimSpace(bearerToken)
+	if bearerToken == "" {
+		return "", fmt.Errorf("bearer token is required")
+	}
+	issuedAt := s.now().UTC()
+	claims := dashboardSessionClaims{
+		TokenHash: s.dashboardTokenHash(bearerToken),
+		Iat:       issuedAt.Unix(),
+		Exp:       issuedAt.Add(8 * time.Hour).Unix(),
+	}
+	payload, err := json.Marshal(claims)
 	if err != nil {
 		return "", err
 	}
-	if claims.Type != "refresh" {
-		return "", ErrWrongTokenType
-	}
-
-	// Generate only a new access token (not a full pair).
-	now := time.Now()
-	accessClaims := Claims{
-		UserID:   claims.UserID,
-		Username: claims.Username,
-		Type:     "access",
-		RegisteredClaims: jwt.RegisteredClaims{
-			Subject:   claims.UserID,
-			IssuedAt:  jwt.NewNumericDate(now),
-			ExpiresAt: jwt.NewNumericDate(now.Add(accessTokenExpiry)),
-		},
-	}
-	newAccessToken, err = jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims).SignedString(s.secret)
-	if err != nil {
-		return "", fmt.Errorf("auth: sign refreshed access token: %w", err)
-	}
-	return newAccessToken, nil
+	payloadPart := base64.RawURLEncoding.EncodeToString(payload)
+	signature := s.sign(payloadPart)
+	return payloadPart + "." + base64.RawURLEncoding.EncodeToString(signature), nil
 }
 
-// parseToken parses a JWT string, validating signature and expiry.
-func (s *Service) parseToken(tokenStr string) (*Claims, error) {
-	token, err := jwt.ParseWithClaims(tokenStr, &Claims{}, func(t *jwt.Token) (any, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+// ParseDashboardSession verifies and decodes a signed dashboard session token.
+func (s *Service) ParseDashboardSession(sessionToken string) (string, error) {
+	sessionToken = strings.TrimSpace(sessionToken)
+	parts := strings.Split(sessionToken, ".")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", ErrInvalidDashboardSessionToken
+	}
+	expectedSig := s.sign(parts[0])
+	providedSig, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "", ErrInvalidDashboardSessionToken
+	}
+	if !hmac.Equal(expectedSig, providedSig) {
+		return "", ErrInvalidDashboardSessionToken
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return "", ErrInvalidDashboardSessionToken
+	}
+	var claims dashboardSessionClaims
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return "", ErrInvalidDashboardSessionToken
+	}
+	if strings.TrimSpace(claims.TokenHash) == "" {
+		return "", ErrInvalidDashboardSessionToken
+	}
+	if claims.Exp <= s.now().UTC().Unix() {
+		return "", ErrInvalidDashboardSessionToken
+	}
+	expectedToken := strings.TrimSpace(s.expectedToken)
+	if expectedToken == "" {
+		return "", ErrBearerTokenNotConfigured
+	}
+	if hmac.Equal([]byte(claims.TokenHash), []byte(s.dashboardTokenHash(expectedToken))) {
+		return expectedToken, nil
+	}
+	for token := range s.dashboardAuth {
+		token = strings.TrimSpace(token)
+		if token == "" || token == expectedToken {
+			continue
 		}
-		return s.secret, nil
-	})
-	if err != nil {
-		if errors.Is(err, jwt.ErrTokenExpired) {
-			return nil, ErrTokenExpired
+		if hmac.Equal([]byte(claims.TokenHash), []byte(s.dashboardTokenHash(token))) {
+			return token, nil
 		}
-		return nil, ErrInvalidToken
 	}
-	claims, ok := token.Claims.(*Claims)
-	if !ok || !token.Valid {
-		return nil, ErrInvalidToken
-	}
-	return claims, nil
+	return "", ErrInvalidDashboardSessionToken
 }
 
-// ─── Registration & Login ────────────────────────────────────────────────────
-
-// Register creates a new user and returns an AuthResult with JWT tokens.
-// Password must be at least 8 characters.
-func (s *Service) Register(username, email, password string) (*AuthResult, error) {
-	if len(password) < 8 {
-		return nil, ErrWeakPassword
-	}
-
-	user, err := s.store.CreateUser(username, email, password)
-	if err != nil {
-		return nil, fmt.Errorf("auth: register: %w", err)
-	}
-
-	accessToken, refreshToken, err := s.GenerateTokenPair(user.ID, user.Username)
-	if err != nil {
-		return nil, err
-	}
-
-	return &AuthResult{
-		UserID:       user.ID,
-		Username:     user.Username,
-		AccessToken:  accessToken,
-		RefreshToken: refreshToken,
-		ExpiresIn:    int(accessTokenExpiry.Seconds()),
-	}, nil
+func (s *Service) sign(payloadPart string) []byte {
+	mac := hmac.New(sha256.New, s.jwtSecret)
+	_, _ = mac.Write([]byte(payloadPart))
+	return mac.Sum(nil)
 }
 
-// Login authenticates a user by username or email and password, returning JWT
-// tokens. On any failure (wrong password, nonexistent user), it returns
-// ErrInvalidCredentials with no information about which part failed. Uses
-// bcrypt.CompareHashAndPassword which is inherently constant-time.
-func (s *Service) Login(identifier, password string) (*AuthResult, error) {
-	user, err := s.lookupUserForLogin(identifier)
-	if err != nil {
-		if !errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("auth: login lookup: %w", err)
+func (s *Service) dashboardTokenHash(token string) string {
+	mac := hmac.New(sha256.New, s.jwtSecret)
+	_, _ = mac.Write([]byte("dashboard:"))
+	_, _ = mac.Write([]byte(token))
+	return base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func (s *Service) SetBearerToken(token string) {
+	s.expectedToken = strings.TrimSpace(token)
+}
+
+func (s *Service) SetDashboardSessionTokens(tokens []string) {
+	s.dashboardAuth = make(map[string]struct{})
+	for _, token := range tokens {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			continue
 		}
-		// User not found — perform a dummy bcrypt compare to prevent timing attacks
-		// that could reveal whether the username exists.
-		bcrypt.CompareHashAndPassword(
-			[]byte("$2a$10$xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
-			[]byte(password),
-		)
-		return nil, ErrInvalidCredentials
+		s.dashboardAuth[token] = struct{}{}
 	}
-
-	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
-		return nil, ErrInvalidCredentials
-	}
-
-	accessToken, refreshToken, err := s.GenerateTokenPair(user.ID, user.Username)
-	if err != nil {
-		return nil, err
-	}
-
-	return &AuthResult{
-		UserID:       user.ID,
-		Username:     user.Username,
-		AccessToken:  accessToken,
-		RefreshToken: refreshToken,
-		ExpiresIn:    int(accessTokenExpiry.Seconds()),
-	}, nil
 }
 
-func (s *Service) lookupUserForLogin(identifier string) (*cloudstore.CloudUser, error) {
-	user, err := s.store.GetUserByUsername(identifier)
-	if err == nil {
-		return user, nil
+func (s *Service) SetAllowedProjects(projects []string) {
+	s.allowed = make(map[string]struct{})
+	for _, project := range projects {
+		normalized, _ := store.NormalizeProject(project)
+		normalized = strings.TrimSpace(normalized)
+		if normalized == "" {
+			continue
+		}
+		s.allowed[normalized] = struct{}{}
 	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
+}
 
-	return s.store.GetUserByEmail(identifier)
+func (s *Service) AuthorizeProject(project string) error {
+	return authorizeProjectAgainstAllowlist(project, s.allowed)
+}
+
+// EnrolledProjects returns the sorted list of projects that this Service is
+// authorized to serve. Used by cloudserver's mutation pull to filter mutations
+// to the caller's enrolled projects (REQ-202).
+//
+// The interface is cloudserver.EnrolledProjectsProvider; this method makes
+// *Service satisfy it without importing cloudserver (structural assertion).
+func (s *Service) EnrolledProjects() []string {
+	return sortedAllowlist(s.allowed)
+}
+
+func (a *ProjectScopeAuthorizer) SetAllowedProjects(projects []string) {
+	a.allowed = make(map[string]struct{})
+	for _, project := range projects {
+		normalized, _ := store.NormalizeProject(project)
+		normalized = strings.TrimSpace(normalized)
+		if normalized == "" {
+			continue
+		}
+		a.allowed[normalized] = struct{}{}
+	}
+}
+
+func (a *ProjectScopeAuthorizer) AuthorizeProject(project string) error {
+	return authorizeProjectAgainstAllowlist(project, a.allowed)
+}
+
+// EnrolledProjects returns the sorted list of projects this authorizer allows.
+// Matches the cloudserver.EnrolledProjectsProvider contract so mutation pull
+// can filter server-side by the caller's enrolled projects (REQ-202) rather
+// than fail-closing to an empty result set.
+func (a *ProjectScopeAuthorizer) EnrolledProjects() []string {
+	return sortedAllowlist(a.allowed)
+}
+
+// sortedAllowlist returns a sorted slice of the map keys.
+// Isolated to one spot so both Service and ProjectScopeAuthorizer behave
+// identically and tests can pin ordering.
+func sortedAllowlist(allowed map[string]struct{}) []string {
+	if len(allowed) == 0 {
+		return []string{}
+	}
+	out := make([]string, 0, len(allowed))
+	for project := range allowed {
+		out = append(out, project)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func authorizeProjectAgainstAllowlist(project string, allowed map[string]struct{}) error {
+	if len(allowed) == 0 {
+		return fmt.Errorf("cloud project allowlist is not configured")
+	}
+	normalized, _ := store.NormalizeProject(project)
+	normalized = strings.TrimSpace(normalized)
+	if normalized == "" {
+		return fmt.Errorf("project is required")
+	}
+	if _, ok := allowed[normalized]; ok {
+		return nil
+	}
+	return fmt.Errorf("%w", ErrProjectNotAllowed)
+}
+
+func (s *Service) Authorize(r *http.Request) error {
+	if strings.TrimSpace(s.expectedToken) == "" {
+		return ErrBearerTokenNotConfigured
+	}
+	header := strings.TrimSpace(r.Header.Get("Authorization"))
+	if header == "" {
+		return fmt.Errorf("missing authorization header")
+	}
+	parts := strings.Fields(header)
+	if len(parts) != 2 {
+		return fmt.Errorf("authorization must use Bearer token")
+	}
+	if !strings.EqualFold(parts[0], "Bearer") {
+		return fmt.Errorf("authorization must use Bearer token")
+	}
+	token := strings.TrimSpace(parts[1])
+	if token == "" {
+		return fmt.Errorf("bearer token is required")
+	}
+	if token != s.expectedToken {
+		return fmt.Errorf("invalid bearer token")
+	}
+	return nil
 }

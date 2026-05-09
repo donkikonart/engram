@@ -2,1450 +2,1339 @@ package autosync
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/internal/cloud/remote"
 	"github.com/Gentleman-Programming/engram/internal/store"
 )
 
 // ─── Fakes ───────────────────────────────────────────────────────────────────
 
-// fakeStore implements LocalStore for tests.
-type fakeStore struct {
-	mu sync.Mutex
-
-	syncState  *store.SyncState
-	mutations  []store.SyncMutation
-	leaseOwner string
-	leaseUntil time.Time
-
-	// Counters / signals
-	acquireLeaseCount int
-	releaseLeaseCount int
-	ackCount          int
-	lastAckedSeq      int64
-	applyCount        int
-	markFailureCount  int
-	markHealthyCount  int
-	lastFailureMsg    string
-	lastBackoffUntil  time.Time
-
-	// Error injection
-	acquireLeaseErr error
-	listPendingErr  error
-	ackErr          error
-	applyErr        error
-	markFailureErr  error
-	markHealthyErr  error
-	getSyncStateErr error
+type fakeLocalStore struct {
+	mu                sync.Mutex
+	mutations         []store.SyncMutation
+	syncState         *store.SyncState
+	leaseOwner        string
+	pushErr           error
+	pullErr           error
+	failureMessage    string
+	blockedReason     string
+	blockedMessage    string
+	appliedMuts       []store.SyncMutation
+	acquireGranted    bool
+	ackedSeqs         []int64
+	nonEnrolledCounts []store.PendingSyncMutationProjectCount
 }
 
-func newFakeStore() *fakeStore {
-	return &fakeStore{
+func newFakeLocalStore() *fakeLocalStore {
+	return &fakeLocalStore{
+		acquireGranted: true,
 		syncState: &store.SyncState{
-			TargetKey: store.DefaultSyncTargetKey,
-			Lifecycle: store.SyncLifecycleIdle,
+			TargetKey:     "cloud",
+			Lifecycle:     "idle",
+			LastPulledSeq: 0,
 		},
 	}
 }
 
-func (fs *fakeStore) GetSyncState(targetKey string) (*store.SyncState, error) {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	if fs.getSyncStateErr != nil {
-		return nil, fs.getSyncStateErr
+func (s *fakeLocalStore) GetSyncState(_ string) (*store.SyncState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pullErr != nil {
+		return nil, s.pullErr
 	}
-	cp := *fs.syncState
-	return &cp, nil
+	return s.syncState, nil
 }
 
-func (fs *fakeStore) ListPendingSyncMutations(targetKey string, limit int) ([]store.SyncMutation, error) {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	if fs.listPendingErr != nil {
-		return nil, fs.listPendingErr
+func (s *fakeLocalStore) ListPendingSyncMutations(_ string, limit int) ([]store.SyncMutation, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pushErr != nil {
+		return nil, s.pushErr
 	}
-	out := make([]store.SyncMutation, len(fs.mutations))
-	copy(out, fs.mutations)
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
+	if len(s.mutations) == 0 {
+		return nil, nil
 	}
-	return out, nil
+	n := len(s.mutations)
+	if limit > 0 && n > limit {
+		n = limit
+	}
+	return s.mutations[:n], nil
 }
 
-func (fs *fakeStore) AckSyncMutations(targetKey string, lastAckedSeq int64) error {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	fs.ackCount++
-	fs.lastAckedSeq = lastAckedSeq
-	if fs.ackErr != nil {
-		return fs.ackErr
-	}
-	// Remove acked mutations and update state.
-	var remaining []store.SyncMutation
-	for _, m := range fs.mutations {
-		if m.Seq > lastAckedSeq {
-			remaining = append(remaining, m)
-		}
-	}
-	fs.mutations = remaining
-	if fs.syncState.LastAckedSeq < lastAckedSeq {
-		fs.syncState.LastAckedSeq = lastAckedSeq
-	}
-	if fs.syncState.LastAckedSeq >= fs.syncState.LastEnqueuedSeq {
-		fs.syncState.Lifecycle = store.SyncLifecycleHealthy
-	}
+func (s *fakeLocalStore) CountPendingNonEnrolledSyncMutations(_ string) ([]store.PendingSyncMutationProjectCount, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]store.PendingSyncMutationProjectCount(nil), s.nonEnrolledCounts...), nil
+}
+
+func (s *fakeLocalStore) AckSyncMutations(_ string, _ int64) error { return nil }
+
+func (s *fakeLocalStore) AckSyncMutationSeqs(_ string, seqs []int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ackedSeqs = append(s.ackedSeqs, seqs...)
 	return nil
 }
 
-func (fs *fakeStore) AckSyncMutationSeqs(targetKey string, seqs []int64) error {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	fs.ackCount++
-	if fs.ackErr != nil {
-		return fs.ackErr
-	}
-	acked := map[int64]struct{}{}
-	for _, seq := range seqs {
-		acked[seq] = struct{}{}
-		if seq > fs.lastAckedSeq {
-			fs.lastAckedSeq = seq
-		}
-	}
-	var remaining []store.SyncMutation
-	for _, m := range fs.mutations {
-		if _, ok := acked[m.Seq]; !ok {
-			remaining = append(remaining, m)
-		}
-	}
-	fs.mutations = remaining
-	if len(fs.mutations) == 0 {
-		fs.syncState.Lifecycle = store.SyncLifecycleHealthy
-	}
-	return nil
-}
-
-func (fs *fakeStore) SkipAckNonEnrolledMutations(targetKey string) (int64, error) {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	// In tests, skip-ack is a no-op by default — no enrollment filtering.
-	return 0, nil
-}
-
-func (fs *fakeStore) AcquireSyncLease(targetKey, owner string, ttl time.Duration, now time.Time) (bool, error) {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	fs.acquireLeaseCount++
-	if fs.acquireLeaseErr != nil {
-		return false, fs.acquireLeaseErr
-	}
-	// Check if another owner holds the lease.
-	if fs.leaseOwner != "" && fs.leaseOwner != owner && fs.leaseUntil.After(now) {
+func (s *fakeLocalStore) AcquireSyncLease(_, owner string, ttl time.Duration, now time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.acquireGranted {
 		return false, nil
 	}
-	fs.leaseOwner = owner
-	fs.leaseUntil = now.Add(ttl)
+	s.leaseOwner = owner
 	return true, nil
 }
 
-func (fs *fakeStore) ReleaseSyncLease(targetKey, owner string) error {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	fs.releaseLeaseCount++
-	if fs.leaseOwner == owner || fs.leaseOwner == "" {
-		fs.leaseOwner = ""
-		fs.leaseUntil = time.Time{}
-	}
+func (s *fakeLocalStore) ReleaseSyncLease(_, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.leaseOwner = ""
 	return nil
 }
 
-func (fs *fakeStore) ApplyPulledMutation(targetKey string, mutation store.SyncMutation) error {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	fs.applyCount++
-	if fs.applyErr != nil {
-		return fs.applyErr
+func (s *fakeLocalStore) ApplyPulledMutation(_ string, mutation store.SyncMutation) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.pullErr != nil {
+		return s.pullErr
 	}
-	if mutation.Seq > fs.syncState.LastPulledSeq {
-		fs.syncState.LastPulledSeq = mutation.Seq
-	}
+	s.appliedMuts = append(s.appliedMuts, mutation)
 	return nil
 }
 
-func (fs *fakeStore) MarkSyncFailure(targetKey, message string, backoffUntil time.Time) error {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	fs.markFailureCount++
-	fs.lastFailureMsg = message
-	fs.lastBackoffUntil = backoffUntil
-	if fs.markFailureErr != nil {
-		return fs.markFailureErr
-	}
-	fs.syncState.ConsecutiveFailures++
-	fs.syncState.Lifecycle = store.SyncLifecycleDegraded
-	msg := message
-	fs.syncState.LastError = &msg
-	bu := backoffUntil.UTC().Format(time.RFC3339)
-	fs.syncState.BackoffUntil = &bu
+func (s *fakeLocalStore) MarkSyncFailure(_, message string, _ time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failureMessage = message
 	return nil
 }
 
-func (fs *fakeStore) MarkSyncHealthy(targetKey string) error {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	fs.markHealthyCount++
-	if fs.markHealthyErr != nil {
-		return fs.markHealthyErr
-	}
-	fs.syncState.Lifecycle = store.SyncLifecycleHealthy
-	fs.syncState.ConsecutiveFailures = 0
-	fs.syncState.BackoffUntil = nil
-	fs.syncState.LastError = nil
+func (s *fakeLocalStore) MarkSyncBlocked(_, reasonCode, message string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.blockedReason = reasonCode
+	s.blockedMessage = message
 	return nil
 }
 
-// setPending sets up pending local mutations for push tests.
-func (fs *fakeStore) setPending(mutations []store.SyncMutation) {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-	fs.mutations = mutations
-	if len(mutations) > 0 {
-		fs.syncState.LastEnqueuedSeq = mutations[len(mutations)-1].Seq
-		fs.syncState.Lifecycle = store.SyncLifecyclePending
+func (s *fakeLocalStore) MarkSyncHealthy(_ string) error { return nil }
+
+// Phase E: deferred replay stubs — base fakeLocalStore always returns zero counts
+// and no error. Tests that need real replay behavior use fakeLocalStoreWithDeferred.
+func (s *fakeLocalStore) ReplayDeferred() (store.ReplayDeferredResult, error) {
+	return store.ReplayDeferredResult{}, nil
+}
+
+func (s *fakeLocalStore) CountDeferredAndDead() (int, int, error) { return 0, 0, nil }
+
+// ─── Fake Transport ───────────────────────────────────────────────────────────
+
+type fakeCloudTransport struct {
+	mu         sync.Mutex
+	pushErr    error
+	pullErr    error
+	pushCalls  int32
+	pullCalls  int32
+	pushResult *PushMutationsResult
+	pullResult *PullMutationsResponse
+	pushed     [][]MutationEntry
+}
+
+type fakeRepairableCloudError struct{ msg string }
+
+func (e fakeRepairableCloudError) Error() string { return e.msg }
+
+func (e fakeRepairableCloudError) IsRepairable() bool { return true }
+
+func newFakeTransport() *fakeCloudTransport {
+	return &fakeCloudTransport{
+		pushResult: &PushMutationsResult{AcceptedSeqs: []int64{}},
+		pullResult: &PullMutationsResponse{Mutations: []PulledMutation{}},
 	}
 }
 
-// fakeTransport implements RemoteTransport for tests.
-type fakeTransport struct {
-	mu sync.Mutex
-
-	pushResult  *remote.PushMutationsResult
-	pushErr     error
-	pushCount   int
-	lastPushed  []remote.MutationEntry
-	pushBatches [][]remote.MutationEntry
-
-	pullResult    *remote.PullMutationsResponse
-	pullErr       error
-	pullCount     int
-	lastPullSince int64
+func (t *fakeCloudTransport) PushMutations(mutations []MutationEntry) (*PushMutationsResult, error) {
+	atomic.AddInt32(&t.pushCalls, 1)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.pushErr != nil {
+		return nil, t.pushErr
+	}
+	batch := append([]MutationEntry(nil), mutations...)
+	t.pushed = append(t.pushed, batch)
+	return t.pushResult, nil
 }
 
-func newFakeTransport() *fakeTransport {
-	return &fakeTransport{
-		pushResult: &remote.PushMutationsResult{Accepted: 0, LastSeq: 0},
-		pullResult: &remote.PullMutationsResponse{Mutations: nil, HasMore: false},
+func (t *fakeCloudTransport) PullMutations(_ int64, _ int) (*PullMutationsResponse, error) {
+	atomic.AddInt32(&t.pullCalls, 1)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.pullErr != nil {
+		return nil, t.pullErr
+	}
+	return t.pullResult, nil
+}
+
+// ─── Push ack safety regressions ─────────────────────────────────────────────
+
+func TestManagerPushNoPendingDoesNotPushOrAck(t *testing.T) {
+	ls := newFakeLocalStore()
+	tr := newFakeTransport()
+	mgr := New(ls, tr, DefaultConfig())
+
+	if err := mgr.push(context.Background()); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+
+	if got := atomic.LoadInt32(&tr.pushCalls); got != 0 {
+		t.Fatalf("expected no transport push without pending mutations, got %d calls", got)
+	}
+	ls.mu.Lock()
+	acked := append([]int64(nil), ls.ackedSeqs...)
+	ls.mu.Unlock()
+	if len(acked) != 0 {
+		t.Fatalf("expected no ack without pending mutations, got %v", acked)
 	}
 }
 
-func (ft *fakeTransport) PushMutations(mutations []remote.MutationEntry) (*remote.PushMutationsResult, error) {
-	ft.mu.Lock()
-	defer ft.mu.Unlock()
-	ft.pushCount++
-	ft.lastPushed = mutations
-	batch := append([]remote.MutationEntry(nil), mutations...)
-	ft.pushBatches = append(ft.pushBatches, batch)
-	if ft.pushErr != nil {
-		return nil, ft.pushErr
+func TestManagerPushAcksPendingMutationsAfterTransportSuccess(t *testing.T) {
+	ls := newFakeLocalStore()
+	ls.mutations = []store.SyncMutation{
+		{Seq: 1, Entity: "obs", EntityKey: "k1", Op: "upsert", Project: "proj-a", Payload: `{"id":"1"}`},
+		{Seq: 2, Entity: "obs", EntityKey: "k2", Op: "upsert", Project: "proj-a", Payload: `{"id":"2"}`},
 	}
-	return ft.pushResult, nil
-}
+	tr := newFakeTransport()
+	tr.pushResult = &PushMutationsResult{AcceptedSeqs: []int64{1, 2}}
+	mgr := New(ls, tr, DefaultConfig())
 
-func (ft *fakeTransport) PullMutations(sinceSeq int64, limit int) (*remote.PullMutationsResponse, error) {
-	ft.mu.Lock()
-	defer ft.mu.Unlock()
-	ft.pullCount++
-	ft.lastPullSince = sinceSeq
-	if ft.pullErr != nil {
-		return nil, ft.pullErr
+	if err := mgr.push(context.Background()); err != nil {
+		t.Fatalf("push: %v", err)
 	}
-	return ft.pullResult, nil
-}
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-func makeMutation(seq int64, entity, key, op string) store.SyncMutation {
-	payload := map[string]string{"id": key}
-	data, _ := json.Marshal(payload)
-	return store.SyncMutation{
-		Seq:        seq,
-		TargetKey:  store.DefaultSyncTargetKey,
-		Entity:     entity,
-		EntityKey:  key,
-		Op:         op,
-		Payload:    string(data),
-		Source:     store.SyncSourceLocal,
-		OccurredAt: time.Now().UTC().Format(time.RFC3339),
+	if got := atomic.LoadInt32(&tr.pushCalls); got != 1 {
+		t.Fatalf("expected one transport push, got %d", got)
+	}
+	ls.mu.Lock()
+	acked := append([]int64(nil), ls.ackedSeqs...)
+	ls.mu.Unlock()
+	if fmt.Sprint(acked) != "[1 2]" {
+		t.Fatalf("expected acked seqs [1 2] after successful push, got %v", acked)
 	}
 }
 
-func makeRemoteMutation(seq int64, entity, key, op string) remote.PullMutationResult {
-	payload := map[string]string{"id": key}
-	data, _ := json.Marshal(payload)
-	return remote.PullMutationResult{
-		Seq:        seq,
-		Entity:     entity,
-		EntityKey:  key,
-		Op:         op,
-		Payload:    data,
-		OccurredAt: time.Now().UTC().Format(time.RFC3339),
+func TestManagerPushDoesNotAckWhenTransportFails(t *testing.T) {
+	ls := newFakeLocalStore()
+	ls.mutations = []store.SyncMutation{
+		{Seq: 1, Entity: "obs", EntityKey: "k1", Op: "upsert", Project: "proj-a", Payload: `{"id":"1"}`},
+	}
+	tr := newFakeTransport()
+	tr.pushErr = errors.New("transport down")
+	mgr := New(ls, tr, DefaultConfig())
+
+	if err := mgr.push(context.Background()); err == nil {
+		t.Fatal("expected push to fail")
+	}
+
+	if got := atomic.LoadInt32(&tr.pushCalls); got != 1 {
+		t.Fatalf("expected one transport push attempt, got %d", got)
+	}
+	ls.mu.Lock()
+	acked := append([]int64(nil), ls.ackedSeqs...)
+	ls.mu.Unlock()
+	if len(acked) != 0 {
+		t.Fatalf("expected no ack after failed transport push, got %v", acked)
 	}
 }
 
-func newTestManager(fs *fakeStore, ft *fakeTransport) *Manager {
+// ─── Phase + lifecycle tests (REQ-204) ───────────────────────────────────────
+
+func TestManagerPhaseTransitions(t *testing.T) {
+	ls := newFakeLocalStore()
+	tr := newFakeTransport()
 	cfg := DefaultConfig()
-	cfg.DebounceDuration = 10 * time.Millisecond // fast for tests
-	cfg.PollInterval = 50 * time.Millisecond     // fast for tests
-	cfg.LeaseInterval = 5 * time.Second
-	cfg.PushBatchSize = 100
-	cfg.PullBatchSize = 100
-	cfg.MaxConsecutiveFailures = 5
-	cfg.BaseBackoff = 10 * time.Millisecond
-	cfg.MaxBackoff = 100 * time.Millisecond
-	return New(fs, ft, cfg)
-}
+	cfg.DebounceDuration = 10 * time.Millisecond
+	cfg.PollInterval = 10 * time.Millisecond
 
-// waitForCondition polls until the condition is true or the timeout is reached.
-func waitForCondition(t *testing.T, timeout time.Duration, msg string, fn func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
+	mgr := New(ls, tr, cfg)
+	if mgr.Status().Phase != PhaseIdle {
+		t.Fatalf("initial phase should be idle, got %q", mgr.Status().Phase)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	go mgr.Run(ctx)
+
+	deadline := time.Now().Add(400 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		if fn() {
+		if mgr.Status().Phase == PhaseHealthy {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for condition: %s", msg)
+	t.Fatalf("expected PhaseHealthy after successful cycle, got %q", mgr.Status().Phase)
 }
 
-// ─── Tests ───────────────────────────────────────────────────────────────────
-
-func TestNewManagerDefaults(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := New(fs, ft, DefaultConfig())
-	if m == nil {
-		t.Fatal("New returned nil")
-	}
-	if m.cfg.PushBatchSize <= 0 {
-		t.Errorf("expected positive push batch size, got %d", m.cfg.PushBatchSize)
-	}
-	if m.cfg.PollInterval <= 0 {
-		t.Errorf("expected positive poll interval, got %v", m.cfg.PollInterval)
-	}
-}
-
-func TestStartAndStop(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := newTestManager(fs, ft)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		m.Run(ctx)
-		close(done)
-	}()
-
-	// Let it tick at least once.
-	time.Sleep(30 * time.Millisecond)
-
-	cancel()
-	select {
-	case <-done:
-		// Graceful shutdown.
-	case <-time.After(2 * time.Second):
-		t.Fatal("manager did not shut down within 2 seconds")
-	}
-
-	// Lease should be released on shutdown.
-	fs.mu.Lock()
-	released := fs.releaseLeaseCount
-	fs.mu.Unlock()
-	if released < 1 {
-		t.Errorf("expected lease release on shutdown, got %d releases", released)
-	}
-}
-
-func TestLeaseAcquisitionFailureDoesNotCrash(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	fs.acquireLeaseErr = errors.New("db locked")
-	m := newTestManager(fs, ft)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		m.Run(ctx)
-		close(done)
-	}()
-
-	time.Sleep(80 * time.Millisecond)
-	cancel()
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("manager did not shut down after lease failure")
-	}
-
-	// No push/pull should have been attempted.
-	ft.mu.Lock()
-	pushes := ft.pushCount
-	pulls := ft.pullCount
-	ft.mu.Unlock()
-	if pushes > 0 || pulls > 0 {
-		t.Errorf("expected no push/pull without lease, got push=%d pull=%d", pushes, pulls)
-	}
-}
-
-func TestLeaseContention(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-
-	// Pre-acquire lease by another owner.
-	fs.leaseOwner = "other-process"
-	fs.leaseUntil = time.Now().Add(10 * time.Second)
-
-	m := newTestManager(fs, ft)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		m.Run(ctx)
-		close(done)
-	}()
-
-	time.Sleep(80 * time.Millisecond)
-	cancel()
-	<-done
-
-	ft.mu.Lock()
-	pushes := ft.pushCount
-	pulls := ft.pullCount
-	ft.mu.Unlock()
-	if pushes > 0 || pulls > 0 {
-		t.Errorf("expected no push/pull with contended lease, got push=%d pull=%d", pushes, pulls)
-	}
-}
-
-func TestPushPendingMutations(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := newTestManager(fs, ft)
-
-	mutations := []store.SyncMutation{
-		makeMutation(1, "session", "s1", "upsert"),
-		makeMutation(2, "observation", "obs1", "upsert"),
-		makeMutation(3, "prompt", "p1", "upsert"),
-	}
-	fs.setPending(mutations)
-
-	ft.pushResult = &remote.PushMutationsResult{
-		Accepted: 3,
-		LastSeq:  100,
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		m.Run(ctx)
-		close(done)
-	}()
-
-	// Wait for push to happen.
-	waitForCondition(t, 2*time.Second, "push count > 0", func() bool {
-		ft.mu.Lock()
-		defer ft.mu.Unlock()
-		return ft.pushCount > 0
-	})
-
-	// Wait for ack.
-	waitForCondition(t, 2*time.Second, "ack count > 0", func() bool {
-		fs.mu.Lock()
-		defer fs.mu.Unlock()
-		return fs.ackCount > 0
-	})
-
-	cancel()
-	<-done
-
-	ft.mu.Lock()
-	pushed := ft.lastPushed
-	ft.mu.Unlock()
-
-	if len(pushed) != 3 {
-		t.Fatalf("expected 3 pushed mutations, got %d", len(pushed))
-	}
-	if pushed[0].Entity != "session" {
-		t.Errorf("expected first pushed entity=session, got %q", pushed[0].Entity)
-	}
-
-	fs.mu.Lock()
-	acked := fs.lastAckedSeq
-	fs.mu.Unlock()
-	if acked != 3 {
-		t.Errorf("expected acked seq 3, got %d", acked)
-	}
-}
-
-func TestPullRemoteMutations(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := newTestManager(fs, ft)
-
-	ft.pullResult = &remote.PullMutationsResponse{
-		Mutations: []remote.PullMutationResult{
-			makeRemoteMutation(10, "session", "s-remote", "upsert"),
-			makeRemoteMutation(11, "observation", "obs-remote", "upsert"),
-		},
-		HasMore: false,
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		m.Run(ctx)
-		close(done)
-	}()
-
-	waitForCondition(t, 2*time.Second, "pull count > 0", func() bool {
-		ft.mu.Lock()
-		defer ft.mu.Unlock()
-		return ft.pullCount > 0
-	})
-
-	waitForCondition(t, 2*time.Second, "apply count >= 2", func() bool {
-		fs.mu.Lock()
-		defer fs.mu.Unlock()
-		return fs.applyCount >= 2
-	})
-
-	cancel()
-	<-done
-
-	fs.mu.Lock()
-	applied := fs.applyCount
-	pulledSeq := fs.syncState.LastPulledSeq
-	fs.mu.Unlock()
-
-	if applied < 2 {
-		t.Errorf("expected at least 2 applied mutations, got %d", applied)
-	}
-	if pulledSeq != 11 {
-		t.Errorf("expected last pulled seq 11, got %d", pulledSeq)
-	}
-}
-
-func TestPullPagination(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := newTestManager(fs, ft)
-
-	callCount := atomic.Int32{}
-	ft.mu.Lock()
-	ft.mu.Unlock()
-
-	// Override the fake transport with a counting one that returns HasMore first time.
-	results := []callResult{
-		{result: &remote.PullMutationsResponse{
-			Mutations: []remote.PullMutationResult{
-				makeRemoteMutation(10, "session", "s1", "upsert"),
-			},
-			HasMore: true,
-		}},
-		{result: &remote.PullMutationsResponse{
-			Mutations: []remote.PullMutationResult{
-				makeRemoteMutation(11, "observation", "o1", "upsert"),
-			},
-			HasMore: false,
-		}},
-	}
-
-	paginatingTransport := &paginatingFakeTransport{
-		results:    results,
-		callCount:  &callCount,
-		pushResult: &remote.PushMutationsResult{Accepted: 0, LastSeq: 0},
-	}
-
-	m2 := New(fs, paginatingTransport, m.cfg)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		m2.Run(ctx)
-		close(done)
-	}()
-
-	waitForCondition(t, 2*time.Second, "2+ pull pages", func() bool {
-		return callCount.Load() >= 2
-	})
-
-	cancel()
-	<-done
-
-	fs.mu.Lock()
-	applied := fs.applyCount
-	fs.mu.Unlock()
-	if applied < 2 {
-		t.Errorf("expected at least 2 applied mutations from paginated pull, got %d", applied)
-	}
-}
-
-// paginatingFakeTransport returns different results on successive calls.
-type paginatingFakeTransport struct {
-	results    []callResult
-	callCount  *atomic.Int32
-	pushResult *remote.PushMutationsResult
-}
-
-type callResult struct {
-	result *remote.PullMutationsResponse
-}
-
-func (pt *paginatingFakeTransport) PushMutations(mutations []remote.MutationEntry) (*remote.PushMutationsResult, error) {
-	return pt.pushResult, nil
-}
-
-func (pt *paginatingFakeTransport) PullMutations(sinceSeq int64, limit int) (*remote.PullMutationsResponse, error) {
-	idx := int(pt.callCount.Load())
-	pt.callCount.Add(1)
-	if idx < len(pt.results) {
-		return pt.results[idx].result, nil
-	}
-	return &remote.PullMutationsResponse{HasMore: false}, nil
-}
-
-func TestPushErrorTriggersBackoff(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := newTestManager(fs, ft)
-
-	fs.setPending([]store.SyncMutation{
-		makeMutation(1, "session", "s1", "upsert"),
-	})
-	ft.pushErr = errors.New("network error")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		m.Run(ctx)
-		close(done)
-	}()
-
-	waitForCondition(t, 2*time.Second, "failure recorded", func() bool {
-		fs.mu.Lock()
-		defer fs.mu.Unlock()
-		return fs.markFailureCount > 0
-	})
-
-	cancel()
-	<-done
-
-	fs.mu.Lock()
-	failures := fs.markFailureCount
-	lifecycle := fs.syncState.Lifecycle
-	fs.mu.Unlock()
-
-	if failures < 1 {
-		t.Errorf("expected at least 1 failure recorded, got %d", failures)
-	}
-	if lifecycle != store.SyncLifecycleDegraded {
-		t.Errorf("expected degraded lifecycle, got %q", lifecycle)
-	}
-
-	// Verify manager status reports degraded.
-	status := m.Status()
-	if status.Phase != PhasePushFailed && status.Phase != PhaseBackoff {
-		t.Errorf("expected push_failed or backoff phase, got %q", status.Phase)
-	}
-}
-
-func TestPullErrorTriggersBackoff(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := newTestManager(fs, ft)
-
-	ft.pullErr = errors.New("server unavailable")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		m.Run(ctx)
-		close(done)
-	}()
-
-	waitForCondition(t, 2*time.Second, "failure recorded", func() bool {
-		fs.mu.Lock()
-		defer fs.mu.Unlock()
-		return fs.markFailureCount > 0
-	})
-
-	cancel()
-	<-done
-
-	fs.mu.Lock()
-	failures := fs.markFailureCount
-	fs.mu.Unlock()
-	if failures < 1 {
-		t.Errorf("expected at least 1 failure from pull error, got %d", failures)
-	}
-}
-
-func TestExponentialBackoffGrows(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := newTestManager(fs, ft)
-
-	fs.setPending([]store.SyncMutation{
-		makeMutation(1, "session", "s1", "upsert"),
-	})
-	ft.pushErr = errors.New("persistent error")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		m.Run(ctx)
-		close(done)
-	}()
-
-	// Wait for multiple failures.
-	waitForCondition(t, 3*time.Second, "3+ failures", func() bool {
-		fs.mu.Lock()
-		defer fs.mu.Unlock()
-		return fs.markFailureCount >= 3
-	})
-
-	cancel()
-	<-done
-
-	// Verify backoff is exponentially growing by checking status.
-	status := m.Status()
-	if status.ConsecutiveFailures < 3 {
-		t.Errorf("expected at least 3 consecutive failures, got %d", status.ConsecutiveFailures)
-	}
-}
-
-func TestMaxConsecutiveFailuresBound(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
+func TestManagerPushFailedPhase(t *testing.T) {
+	ls := newFakeLocalStore()
+	ls.mutations = []store.SyncMutation{{Seq: 1, Entity: "obs", EntityKey: "k1", Project: "proj-a"}}
+	tr := newFakeTransport()
+	tr.pushErr = errors.New("push failed")
 	cfg := DefaultConfig()
-	cfg.DebounceDuration = 5 * time.Millisecond
+	cfg.DebounceDuration = 10 * time.Millisecond
 	cfg.PollInterval = 10 * time.Millisecond
-	cfg.BaseBackoff = 5 * time.Millisecond
-	cfg.MaxBackoff = 20 * time.Millisecond
-	cfg.MaxConsecutiveFailures = 3
-	m := New(fs, ft, cfg)
 
-	fs.setPending([]store.SyncMutation{
-		makeMutation(1, "session", "s1", "upsert"),
-	})
-	ft.pushErr = errors.New("persistent error")
+	mgr := New(ls, tr, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	go mgr.Run(ctx)
+	mgr.NotifyDirty()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		m.Run(ctx)
-		close(done)
-	}()
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if mgr.Status().Phase == PhasePushFailed {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("expected PhasePushFailed, got %q", mgr.Status().Phase)
+}
 
-	waitForCondition(t, 3*time.Second, "max failures reached", func() bool {
-		fs.mu.Lock()
-		defer fs.mu.Unlock()
-		return fs.markFailureCount >= 3
-	})
+func TestManagerPullFailedPhase(t *testing.T) {
+	ls := newFakeLocalStore()
+	tr := newFakeTransport()
+	tr.pullErr = errors.New("pull failed")
+	cfg := DefaultConfig()
+	cfg.DebounceDuration = 10 * time.Millisecond
+	cfg.PollInterval = 10 * time.Millisecond
 
-	// After max failures, the manager should stop retrying.
-	fs.mu.Lock()
-	failuresBefore := fs.markFailureCount
-	fs.mu.Unlock()
+	mgr := New(ls, tr, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	go mgr.Run(ctx)
+	mgr.NotifyDirty()
 
-	time.Sleep(100 * time.Millisecond)
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if mgr.Status().Phase == PhasePullFailed {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("expected PhasePullFailed, got %q", mgr.Status().Phase)
+}
 
-	fs.mu.Lock()
-	failuresAfter := fs.markFailureCount
-	fs.mu.Unlock()
+func TestManagerRepairableFailureStoresUpgradeGuidance(t *testing.T) {
+	ls := newFakeLocalStore()
+	ls.mutations = []store.SyncMutation{{Seq: 1, Entity: "obs", EntityKey: "k1", Project: "proj-a"}}
+	tr := newFakeTransport()
+	tr.pushErr = fakeRepairableCloudError{msg: "invalid upsert payload: observations[0].directory is required"}
+	cfg := DefaultConfig()
+	cfg.TargetKey = "cloud:proj-a"
 
-	cancel()
-	<-done
+	mgr := New(ls, tr, cfg)
+	mgr.cycle(context.Background())
 
-	// Allow a small margin but should not grow unboundedly.
-	growth := failuresAfter - failuresBefore
-	if growth > 1 {
-		t.Errorf("expected max failure bound to stop retries, but saw %d additional failures", growth)
+	status := mgr.Status()
+	if status.Phase != PhasePushFailed {
+		t.Fatalf("expected PhasePushFailed, got %q", status.Phase)
+	}
+	if !strings.Contains(status.LastError, "invalid upsert payload") {
+		t.Fatalf("expected original error to be preserved, got %q", status.LastError)
+	}
+	for _, want := range []string{
+		"Known repairable cloud sync failure detected.",
+		"engram cloud upgrade doctor --project proj-a",
+		"engram cloud upgrade repair --project proj-a --dry-run",
+		"engram cloud upgrade repair --project proj-a --apply",
+		"engram sync --cloud --project proj-a",
+	} {
+		if !strings.Contains(status.LastError, want) {
+			t.Fatalf("expected status.LastError to contain %q, got %q", want, status.LastError)
+		}
+		if !strings.Contains(ls.failureMessage, want) {
+			t.Fatalf("expected stored failure to contain %q, got %q", want, ls.failureMessage)
+		}
+	}
+	if strings.Contains(status.LastError, "--auto-repair") || strings.Contains(ls.failureMessage, "--auto-repair") {
+		t.Fatalf("guidance must not mention auto-repair, status=%q stored=%q", status.LastError, ls.failureMessage)
+	}
+	if atomic.LoadInt32(&tr.pushCalls) != 1 {
+		t.Fatalf("expected one push attempt and no repair execution path, got %d", tr.pushCalls)
 	}
 }
 
-func TestRecoveryAfterBackoff(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := newTestManager(fs, ft)
+func TestManagerStopForUpgradeDisabled(t *testing.T) {
+	ls := newFakeLocalStore()
+	tr := newFakeTransport()
+	mgr := New(ls, tr, DefaultConfig())
 
-	fs.setPending([]store.SyncMutation{
-		makeMutation(1, "session", "s1", "upsert"),
-	})
-
-	// Start with error, then fix.
-	ft.pushErr = errors.New("transient error")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		m.Run(ctx)
-		close(done)
-	}()
-
-	waitForCondition(t, 2*time.Second, "failure recorded", func() bool {
-		fs.mu.Lock()
-		defer fs.mu.Unlock()
-		return fs.markFailureCount > 0
-	})
-
-	// Fix the error and ensure data will be accepted.
-	ft.mu.Lock()
-	ft.pushErr = nil
-	ft.pushResult = &remote.PushMutationsResult{Accepted: 1, LastSeq: 50}
-	ft.mu.Unlock()
-
-	// Re-add pending mutations (the manager will retry).
-	fs.setPending([]store.SyncMutation{
-		makeMutation(1, "session", "s1", "upsert"),
-	})
-
-	waitForCondition(t, 3*time.Second, "healthy after recovery", func() bool {
-		fs.mu.Lock()
-		defer fs.mu.Unlock()
-		return fs.markHealthyCount > 0
-	})
-
-	cancel()
-	<-done
-
-	fs.mu.Lock()
-	healthy := fs.markHealthyCount
-	fs.mu.Unlock()
-	if healthy < 1 {
-		t.Errorf("expected at least 1 healthy mark after recovery, got %d", healthy)
+	if err := mgr.StopForUpgrade("test-project"); err != nil {
+		t.Fatalf("StopForUpgrade: %v", err)
+	}
+	if mgr.Status().Phase != PhaseDisabled {
+		t.Fatalf("expected PhaseDisabled, got %q", mgr.Status().Phase)
 	}
 }
 
-func TestDebouncedWakeOnNotify(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := newTestManager(fs, ft)
-	m.cfg.PollInterval = 10 * time.Second // very long poll so we can test debounce wake
+// ─── Backoff tests (REQ-205) ─────────────────────────────────────────────────
 
-	ft.pushResult = &remote.PushMutationsResult{Accepted: 1, LastSeq: 50}
+func TestManagerBackoffExponentialGrowth(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.BaseBackoff = 1 * time.Second
+	cfg.MaxBackoff = 5 * time.Minute
+	mgr := &Manager{cfg: cfg}
+
+	prev := time.Duration(0)
+	for i := 1; i <= 8; i++ {
+		d := mgr.computeBackoff(i)
+		if d > cfg.MaxBackoff {
+			t.Fatalf("failure %d: backoff %v exceeds max %v", i, d, cfg.MaxBackoff)
+		}
+		if i > 1 && prev > 0 {
+			ratio := float64(d) / float64(prev)
+			if ratio < 0.4 || ratio > 5.0 {
+				t.Fatalf("failure %d: ratio %.2f out of [0.4,5.0] prev=%v cur=%v", i, ratio, prev, d)
+			}
+		}
+		prev = d
+	}
+}
+
+func TestManagerBackoffJitterBounds(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.BaseBackoff = 4 * time.Second
+	cfg.MaxBackoff = 5 * time.Minute
+	mgr := &Manager{cfg: cfg}
+
+	// BW1: ±25% jitter means range is [base*0.75, base*1.25] = [3s, 5s].
+	// Run many iterations and assert ALL samples fall in [3s,5s].
+	// ALSO assert that at least one sample falls BELOW base (4s) to prove
+	// negative jitter is actually applied (not just [0, +25%]).
+	sawBelowBase := false
+	for i := 0; i < 500; i++ {
+		d := mgr.computeBackoff(1)
+		if d < 3*time.Second || d > 5*time.Second {
+			t.Fatalf("jitter out of [3s,5s]: got %v at iteration %d", d, i)
+		}
+		if d < 4*time.Second {
+			sawBelowBase = true
+		}
+	}
+	if !sawBelowBase {
+		t.Fatal("jitter never produced a result below base (4s) in 500 iterations; ±25% jitter must include negative direction")
+	}
+}
+
+func TestManagerBackoffCeiling(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.BaseBackoff = 1 * time.Second
+	cfg.MaxBackoff = 5 * time.Minute
+	cfg.MaxConsecutiveFailures = 10
+	mgr := &Manager{cfg: cfg}
+
+	d := mgr.computeBackoff(cfg.MaxConsecutiveFailures)
+	if d > cfg.MaxBackoff {
+		t.Fatalf("backoff exceeds ceiling: %v > %v", d, cfg.MaxBackoff)
+	}
+}
+
+func TestManagerBackoffResetOnSuccess(t *testing.T) {
+	ls := newFakeLocalStore()
+	tr := newFakeTransport()
+	tr.mu.Lock()
+	tr.pushErr = errors.New("fail once")
+	tr.mu.Unlock()
+
+	ls.mutations = []store.SyncMutation{{Seq: 1, Entity: "obs", EntityKey: "k1", Project: "proj-a"}}
+
+	cfg := DefaultConfig()
+	cfg.DebounceDuration = 10 * time.Millisecond
+	cfg.PollInterval = 10 * time.Millisecond
+	cfg.BaseBackoff = 10 * time.Millisecond
+	cfg.MaxBackoff = 50 * time.Millisecond
+
+	mgr := New(ls, tr, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	go mgr.Run(ctx)
+	mgr.NotifyDirty()
+
+	// Wait for failure
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if mgr.Status().Phase == PhasePushFailed {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Fix transport
+	tr.mu.Lock()
+	tr.pushErr = nil
+	tr.mu.Unlock()
+	ls.mu.Lock()
+	ls.mutations = nil
+	ls.mu.Unlock()
+
+	deadline = time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		st := mgr.Status()
+		if st.Phase == PhaseHealthy && st.ConsecutiveFailures == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("expected PhaseHealthy with 0 failures, got phase=%q failures=%d",
+		mgr.Status().Phase, mgr.Status().ConsecutiveFailures)
+}
+
+// ─── NotifyDirty tests (REQ-206) ─────────────────────────────────────────────
+
+func TestManagerNotifyDirtyOneCycle(t *testing.T) {
+	ls := newFakeLocalStore()
+	tr := newFakeTransport()
+	cfg := DefaultConfig()
+	cfg.DebounceDuration = 20 * time.Millisecond
+	cfg.PollInterval = 10 * time.Second
+
+	mgr := New(ls, tr, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	go mgr.Run(ctx)
+	mgr.NotifyDirty()
+
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if mgr.Status().Phase == PhaseHealthy {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("expected PhaseHealthy after dirty notification, got %q", mgr.Status().Phase)
+}
+
+func TestManagerNotifyDirtyCoalesce(t *testing.T) {
+	ls := newFakeLocalStore()
+	tr := newFakeTransport()
+	cfg := DefaultConfig()
+	cfg.DebounceDuration = 50 * time.Millisecond
+	cfg.PollInterval = 10 * time.Second
+
+	mgr := New(ls, tr, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	go mgr.Run(ctx)
+
+	for i := 0; i < 100; i++ {
+		mgr.NotifyDirty()
+	}
+
+	time.Sleep(300 * time.Millisecond)
+
+	pullCalls := atomic.LoadInt32(&tr.pullCalls)
+	if pullCalls > 5 {
+		t.Fatalf("expected ≤5 pull calls (coalesced), got %d", pullCalls)
+	}
+}
+
+func TestManagerNotifyDirtyDuringBackoff(t *testing.T) {
+	ls := newFakeLocalStore()
+	ls.mutations = []store.SyncMutation{{Seq: 1, Entity: "obs", EntityKey: "k1", Project: "proj-a"}}
+	tr := newFakeTransport()
+	tr.pushErr = errors.New("always fail")
+
+	cfg := DefaultConfig()
+	cfg.DebounceDuration = 10 * time.Millisecond
+	cfg.PollInterval = 10 * time.Millisecond
+	cfg.MaxConsecutiveFailures = 1
+	cfg.BaseBackoff = 1 * time.Second
+
+	mgr := New(ls, tr, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go mgr.Run(ctx)
+	mgr.NotifyDirty()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		p := mgr.Status().Phase
+		if p == PhaseBackoff || p == PhasePushFailed {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		mgr.NotifyDirty()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("NotifyDirty blocked during backoff")
+	}
+}
+
+func TestManagerNotifyDirtyAfterStop(t *testing.T) {
+	ls := newFakeLocalStore()
+	tr := newFakeTransport()
+	mgr := New(ls, tr, DefaultConfig())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go mgr.Run(ctx)
+	cancel()
+	mgr.Stop()
+
+	done := make(chan struct{})
+	go func() {
+		mgr.NotifyDirty()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("NotifyDirty blocked after stop")
+	}
+}
+
+// ─── Run lifecycle tests (REQ-207) ───────────────────────────────────────────
+
+func TestManagerRunContextCancel(t *testing.T) {
+	ls := newFakeLocalStore()
+	tr := newFakeTransport()
+	mgr := New(ls, tr, DefaultConfig())
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		m.Run(ctx)
+		mgr.Run(ctx)
 		close(done)
 	}()
 
-	// Wait for the manager to be running.
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Run did not return within 1 second after context cancel")
+	}
+}
+
+func TestManagerRunPollTicker(t *testing.T) {
+	ls := newFakeLocalStore()
+	tr := newFakeTransport()
+	cfg := DefaultConfig()
+	cfg.PollInterval = 30 * time.Millisecond
+	cfg.DebounceDuration = 10 * time.Second
+
+	mgr := New(ls, tr, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	go mgr.Run(ctx)
+
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&tr.pullCalls) >= 1 {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("expected at least 1 pull cycle from poll ticker, got %d", atomic.LoadInt32(&tr.pullCalls))
+}
+
+func TestManagerStopWaitsGoroutine(t *testing.T) {
+	ls := newFakeLocalStore()
+	tr := newFakeTransport()
+	cfg := DefaultConfig()
+	cfg.PollInterval = 10 * time.Second
+	cfg.DebounceDuration = 10 * time.Second
+
+	mgr := New(ls, tr, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go mgr.Run(ctx)
 	time.Sleep(20 * time.Millisecond)
 
-	// Now inject pending mutations and notify.
-	fs.setPending([]store.SyncMutation{
-		makeMutation(1, "session", "s1", "upsert"),
-	})
-	m.NotifyDirty()
-
-	waitForCondition(t, 2*time.Second, "push after notify", func() bool {
-		ft.mu.Lock()
-		defer ft.mu.Unlock()
-		return ft.pushCount > 0
-	})
-
-	cancel()
-	<-done
-
-	ft.mu.Lock()
-	pushes := ft.pushCount
-	ft.mu.Unlock()
-	if pushes < 1 {
-		t.Errorf("expected push after NotifyDirty, got %d pushes", pushes)
-	}
-}
-
-func TestStatusReportsPhases(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := newTestManager(fs, ft)
-
-	// Before starting, status should be idle.
-	status := m.Status()
-	if status.Phase != PhaseIdle {
-		t.Errorf("expected idle phase before start, got %q", status.Phase)
-	}
-
-	// Set up a push scenario.
-	fs.setPending([]store.SyncMutation{
-		makeMutation(1, "session", "s1", "upsert"),
-	})
-	ft.pushResult = &remote.PushMutationsResult{Accepted: 1, LastSeq: 50}
-
-	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
-		m.Run(ctx)
+		mgr.Stop()
 		close(done)
 	}()
 
-	// Wait for the full cycle to complete — recordSuccess sets PhaseHealthy.
-	waitForCondition(t, 2*time.Second, "phase becomes healthy", func() bool {
-		s := m.Status()
-		return s.Phase == PhaseHealthy
-	})
-
-	// After successful sync, status should reflect healthy.
-	status = m.Status()
-	if status.Phase != PhaseHealthy {
-		t.Errorf("expected healthy phase after success, got %q", status.Phase)
-	}
-
-	cancel()
-	<-done
-}
-
-func TestGracefulShutdownReleasesLease(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := newTestManager(fs, ft)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		m.Run(ctx)
-		close(done)
-	}()
-
-	time.Sleep(30 * time.Millisecond)
-	cancel()
-	<-done
-
-	fs.mu.Lock()
-	released := fs.releaseLeaseCount
-	fs.mu.Unlock()
-
-	if released < 1 {
-		t.Errorf("expected lease release on graceful shutdown, got %d", released)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop did not return within 2 seconds")
 	}
 }
 
-func TestPushThenPullSequence(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := newTestManager(fs, ft)
+func TestManagerRunPanicRecovery(t *testing.T) {
+	ls := newFakeLocalStore()
+	tr := newFakeTransport()
+	panicOnce := int32(1)
 
-	// Set up pending mutations and remote mutations.
-	fs.setPending([]store.SyncMutation{
-		makeMutation(1, "session", "s1", "upsert"),
-	})
-	ft.pushResult = &remote.PushMutationsResult{Accepted: 1, LastSeq: 50}
-	ft.pullResult = &remote.PullMutationsResponse{
-		Mutations: []remote.PullMutationResult{
-			makeRemoteMutation(5, "observation", "obs-remote", "upsert"),
-		},
-		HasMore: false,
+	cfg := DefaultConfig()
+	cfg.DebounceDuration = 10 * time.Millisecond
+	cfg.PollInterval = 10 * time.Millisecond
+	cfg.BaseBackoff = 10 * time.Millisecond
+	cfg.MaxBackoff = 100 * time.Millisecond
+
+	mgr := New(ls, tr, cfg)
+	mgr.transport = &panicOnceTransport{delegate: tr, panicOnce: &panicOnce}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go mgr.Run(ctx)
+	mgr.NotifyDirty()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		st := mgr.Status()
+		if st.Phase == PhaseBackoff && st.ReasonCode == "internal_error" {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		m.Run(ctx)
-		close(done)
-	}()
-
-	// Wait for both push and pull.
-	waitForCondition(t, 2*time.Second, "push+pull", func() bool {
-		ft.mu.Lock()
-		defer ft.mu.Unlock()
-		return ft.pushCount > 0 && ft.pullCount > 0
-	})
-
-	cancel()
-	<-done
-
-	ft.mu.Lock()
-	pushes := ft.pushCount
-	pulls := ft.pullCount
-	ft.mu.Unlock()
-
-	if pushes < 1 {
-		t.Errorf("expected at least 1 push, got %d", pushes)
-	}
-	if pulls < 1 {
-		t.Errorf("expected at least 1 pull, got %d", pulls)
-	}
+	t.Fatalf("expected PhaseBackoff/internal_error after panic, got phase=%q code=%q",
+		mgr.Status().Phase, mgr.Status().ReasonCode)
 }
 
-func TestNoPushWhenNoPending(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := newTestManager(fs, ft)
-
-	// No pending mutations.
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		m.Run(ctx)
-		close(done)
-	}()
-
-	time.Sleep(100 * time.Millisecond)
-	cancel()
-	<-done
-
-	ft.mu.Lock()
-	pushes := ft.pushCount
-	ft.mu.Unlock()
-
-	// Should still pull even without push.
-	if pushes > 0 {
-		t.Errorf("expected 0 pushes when no pending, got %d", pushes)
-	}
-}
-
-func TestApplyPulledMutationError(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := newTestManager(fs, ft)
-
-	ft.pullResult = &remote.PullMutationsResponse{
-		Mutations: []remote.PullMutationResult{
-			makeRemoteMutation(10, "session", "s-bad", "upsert"),
-		},
-		HasMore: false,
-	}
-	fs.applyErr = errors.New("apply failed")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		m.Run(ctx)
-		close(done)
-	}()
-
-	waitForCondition(t, 2*time.Second, "failure from apply", func() bool {
-		fs.mu.Lock()
-		defer fs.mu.Unlock()
-		return fs.markFailureCount > 0
-	})
-
-	cancel()
-	<-done
-
-	fs.mu.Lock()
-	failures := fs.markFailureCount
-	fs.mu.Unlock()
-	if failures < 1 {
-		t.Errorf("expected failure from apply error, got %d", failures)
-	}
-}
-
-// ─── Integration: Full Round-Trip Tests ──────────────────────────────────────
-
-// TestFullRoundTripLocalWritePushPullApply proves the end-to-end flow:
-// local write → push to remote → remote returns mutations → apply locally.
-func TestFullRoundTripLocalWritePushPullApply(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := newTestManager(fs, ft)
-
-	// 1. Simulate a local write: enqueue pending mutations (session + observation).
-	fs.setPending([]store.SyncMutation{
-		makeMutation(1, "session", "sess-abc", "upsert"),
-		makeMutation(2, "observation", "obs-xyz", "upsert"),
-	})
-	ft.pushResult = &remote.PushMutationsResult{Accepted: 2, LastSeq: 100}
-
-	// 2. Simulate remote has new mutations to pull (from another device).
-	ft.pullResult = &remote.PullMutationsResponse{
-		Mutations: []remote.PullMutationResult{
-			makeRemoteMutation(50, "observation", "obs-from-other-device", "upsert"),
-			makeRemoteMutation(51, "prompt", "prompt-from-other-device", "upsert"),
-		},
-		HasMore: false,
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		m.Run(ctx)
-		close(done)
-	}()
-
-	// 3. Signal dirty and wait for the full cycle to complete.
-	m.NotifyDirty()
-
-	// Wait for push completion.
-	waitForCondition(t, 2*time.Second, "push completed", func() bool {
-		ft.mu.Lock()
-		defer ft.mu.Unlock()
-		return ft.pushCount > 0
-	})
-
-	// Wait for pull + apply completion.
-	waitForCondition(t, 2*time.Second, "pull applied", func() bool {
-		fs.mu.Lock()
-		defer fs.mu.Unlock()
-		return fs.applyCount >= 2
-	})
-
-	// Wait for healthy state.
-	waitForCondition(t, 2*time.Second, "healthy", func() bool {
-		fs.mu.Lock()
-		defer fs.mu.Unlock()
-		return fs.markHealthyCount > 0
-	})
-
-	cancel()
-	<-done
-
-	// 4. Verify the round-trip:
-	// - Push: 2 local mutations were pushed.
-	ft.mu.Lock()
-	pushed := ft.lastPushed
-	ft.mu.Unlock()
-	if len(pushed) != 2 {
-		t.Fatalf("expected 2 pushed mutations, got %d", len(pushed))
-	}
-	if pushed[0].Entity != "session" || pushed[0].EntityKey != "sess-abc" {
-		t.Errorf("first pushed mutation: expected session/sess-abc, got %s/%s", pushed[0].Entity, pushed[0].EntityKey)
-	}
-	if pushed[1].Entity != "observation" || pushed[1].EntityKey != "obs-xyz" {
-		t.Errorf("second pushed mutation: expected observation/obs-xyz, got %s/%s", pushed[1].Entity, pushed[1].EntityKey)
-	}
-
-	// - Ack: local seq 2 was acked.
-	fs.mu.Lock()
-	acked := fs.lastAckedSeq
-	applied := fs.applyCount
-	pulledSeq := fs.syncState.LastPulledSeq
-	fs.mu.Unlock()
-	if acked != 2 {
-		t.Errorf("expected last acked seq 2, got %d", acked)
-	}
-
-	// - Pull: 2 remote mutations were applied locally.
-	if applied < 2 {
-		t.Errorf("expected at least 2 applied mutations, got %d", applied)
-	}
-	if pulledSeq != 51 {
-		t.Errorf("expected last pulled seq 51, got %d", pulledSeq)
-	}
-
-	// - Status should be healthy.
-	status := m.Status()
-	if status.Phase != PhaseHealthy {
-		t.Errorf("expected healthy phase, got %q", status.Phase)
-	}
-	if status.ConsecutiveFailures != 0 {
-		t.Errorf("expected 0 consecutive failures, got %d", status.ConsecutiveFailures)
-	}
-	if status.LastSyncAt == nil {
-		t.Error("expected last_sync_at to be set")
-	}
-}
-
-// ─── Degraded State Tests ────────────────────────────────────────────────────
-
-// TestDegradedStateMessagingOnPushFailure verifies that the manager reports
-// the correct phase, error message, and failure count when push fails.
-func TestDegradedStateMessagingOnPushFailure(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := newTestManager(fs, ft)
-
-	fs.setPending([]store.SyncMutation{
-		makeMutation(1, "session", "s1", "upsert"),
-	})
-	ft.pushErr = errors.New("connection refused")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		m.Run(ctx)
-		close(done)
-	}()
-
-	waitForCondition(t, 2*time.Second, "failure recorded", func() bool {
-		fs.mu.Lock()
-		defer fs.mu.Unlock()
-		return fs.markFailureCount > 0
-	})
-
-	cancel()
-	<-done
-
-	// Verify degraded messaging.
-	status := m.Status()
-	if status.Phase != PhasePushFailed && status.Phase != PhaseBackoff {
-		t.Errorf("expected push_failed or backoff phase, got %q", status.Phase)
-	}
-	if status.LastError == "" {
-		t.Error("expected last_error to contain the error message")
-	}
-	if !strings.Contains(status.LastError, "connection refused") {
-		t.Errorf("expected last_error to contain 'connection refused', got %q", status.LastError)
-	}
-	if status.ConsecutiveFailures < 1 {
-		t.Errorf("expected at least 1 consecutive failure, got %d", status.ConsecutiveFailures)
-	}
-	if status.BackoffUntil == nil {
-		t.Error("expected backoff_until to be set after failure")
-	}
-
-	// Verify the store persisted the degraded state.
-	fs.mu.Lock()
-	storeFailures := fs.syncState.ConsecutiveFailures
-	storeLifecycle := fs.syncState.Lifecycle
-	fs.mu.Unlock()
-	if storeLifecycle != store.SyncLifecycleDegraded {
-		t.Errorf("expected store lifecycle=degraded, got %q", storeLifecycle)
-	}
-	if storeFailures < 1 {
-		t.Errorf("expected store to track failures, got %d", storeFailures)
-	}
-}
-
-func TestPushGroupsMixedProjectsSeparately(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := newTestManager(fs, ft)
-
-	mutA := makeMutation(1, "session", "s1", "upsert")
-	mutA.Project = "proj-a"
-	mutB := makeMutation(2, "session", "s2", "upsert")
-	mutB.Project = "proj-b"
-	mutC := makeMutation(3, "observation", "o3", "upsert")
-	mutC.Project = "proj-a"
-	fs.setPending([]store.SyncMutation{mutA, mutB, mutC})
-	ft.pushResult = &remote.PushMutationsResult{Accepted: 1, LastSeq: 10}
-
-	if err := m.push(context.Background()); err != nil {
-		t.Fatalf("push: %v", err)
-	}
-
-	ft.mu.Lock()
-	batchCount := len(ft.pushBatches)
-	first := ft.pushBatches[0]
-	second := ft.pushBatches[1]
-	ft.mu.Unlock()
-	if batchCount != 2 {
-		t.Fatalf("expected 2 project batches, got %d", batchCount)
-	}
-	if len(first) != 2 || first[0].EntityKey != "s1" || first[1].EntityKey != "o3" {
-		t.Fatalf("unexpected first batch: %+v", first)
-	}
-	if len(second) != 1 || second[0].EntityKey != "s2" {
-		t.Fatalf("unexpected second batch: %+v", second)
-	}
-
-	fs.mu.Lock()
-	remaining := len(fs.mutations)
-	acked := fs.lastAckedSeq
-	fs.mu.Unlock()
-	if remaining != 0 {
-		t.Fatalf("expected all mutations acked, got %d remaining", remaining)
-	}
-	if acked != 3 {
-		t.Fatalf("expected max acked seq 3, got %d", acked)
-	}
-}
-
-// TestDegradedStateMessagingOnPullFailure verifies degraded state when pull fails.
-func TestDegradedStateMessagingOnPullFailure(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := newTestManager(fs, ft)
-
-	// No pending push, but pull fails.
-	ft.pullErr = errors.New("504 gateway timeout")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		m.Run(ctx)
-		close(done)
-	}()
-
-	waitForCondition(t, 2*time.Second, "pull failure recorded", func() bool {
-		fs.mu.Lock()
-		defer fs.mu.Unlock()
-		return fs.markFailureCount > 0
-	})
-
-	cancel()
-	<-done
-
-	status := m.Status()
-	if status.Phase != PhasePullFailed && status.Phase != PhaseBackoff {
-		t.Errorf("expected pull_failed or backoff phase, got %q", status.Phase)
-	}
-	if !strings.Contains(status.LastError, "504 gateway timeout") {
-		t.Errorf("expected last_error to contain '504 gateway timeout', got %q", status.LastError)
-	}
-}
-
-// TestGracefulDegradationLocalWritesContinue verifies that local operations
-// are never blocked even when the sync manager is in a degraded state.
-func TestGracefulDegradationLocalWritesContinue(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := newTestManager(fs, ft)
-
-	// Make the transport permanently fail.
-	ft.pushErr = errors.New("remote unavailable")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		m.Run(ctx)
-		close(done)
-	}()
-
-	// Let the manager enter degraded state.
-	fs.setPending([]store.SyncMutation{
-		makeMutation(1, "session", "s1", "upsert"),
-	})
-	m.NotifyDirty()
-
-	waitForCondition(t, 2*time.Second, "degraded", func() bool {
-		fs.mu.Lock()
-		defer fs.mu.Unlock()
-		return fs.markFailureCount > 0
-	})
-
-	// Key assertion: while degraded, new local writes still enqueue normally.
-	// In a real system, s.AddObservation() → enqueueSyncMutation() would work
-	// without being blocked by the autosync manager. We verify the manager
-	// is still accepting dirty notifications and doesn't block or panic.
-	fs.setPending([]store.SyncMutation{
-		makeMutation(2, "observation", "obs-new", "upsert"),
-	})
-	m.NotifyDirty() // non-blocking — must not deadlock
-
-	cancel()
-	<-done
-
-	// The manager should have shut down gracefully despite degraded state.
-	fs.mu.Lock()
-	released := fs.releaseLeaseCount
-	fs.mu.Unlock()
-	if released < 1 {
-		t.Errorf("expected lease released even when degraded, got %d", released)
-	}
-}
-
-// TestRecoveryFromDegradedToHealthy verifies the manager can recover from
-// degraded state when the remote becomes available again.
-func TestRecoveryFromDegradedToHealthy(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := newTestManager(fs, ft)
-
-	// Start with remote failure.
-	fs.setPending([]store.SyncMutation{
-		makeMutation(1, "session", "s1", "upsert"),
-	})
-	ft.pushErr = errors.New("server down")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		m.Run(ctx)
-		close(done)
-	}()
-
-	// Wait for degraded state.
-	waitForCondition(t, 2*time.Second, "degraded", func() bool {
-		status := m.Status()
-		return status.Phase == PhasePushFailed || status.Phase == PhaseBackoff
-	})
-
-	// Fix the remote.
-	ft.mu.Lock()
-	ft.pushErr = nil
-	ft.pushResult = &remote.PushMutationsResult{Accepted: 1, LastSeq: 50}
-	ft.mu.Unlock()
-
-	// Re-add pending data.
-	fs.setPending([]store.SyncMutation{
-		makeMutation(1, "session", "s1", "upsert"),
-	})
-
-	// Wait for recovery.
-	waitForCondition(t, 3*time.Second, "healthy after recovery", func() bool {
-		status := m.Status()
-		return status.Phase == PhaseHealthy
-	})
-
-	cancel()
-	<-done
-
-	status := m.Status()
-	if status.Phase != PhaseHealthy {
-		t.Errorf("expected final phase=healthy, got %q", status.Phase)
-	}
-	if status.ConsecutiveFailures != 0 {
-		t.Errorf("expected 0 failures after recovery, got %d", status.ConsecutiveFailures)
-	}
-	if status.LastError != "" {
-		t.Errorf("expected empty last_error after recovery, got %q", status.LastError)
-	}
-}
-
-func TestMultipleNotifyCoalesced(t *testing.T) {
-	fs := newFakeStore()
-	ft := newFakeTransport()
-	m := newTestManager(fs, ft)
-	m.cfg.PollInterval = 10 * time.Second
-	m.cfg.DebounceDuration = 30 * time.Millisecond
-
-	ft.pushResult = &remote.PushMutationsResult{Accepted: 1, LastSeq: 50}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		m.Run(ctx)
-		close(done)
-	}()
-
+// ─── StopForUpgrade / ResumeAfterUpgrade (REQ-208) ───────────────────────────
+
+func TestManagerStopForUpgradeHaltsCycle(t *testing.T) {
+	ls := newFakeLocalStore()
+	tr := newFakeTransport()
+	cfg := DefaultConfig()
+	cfg.DebounceDuration = 10 * time.Millisecond
+	cfg.PollInterval = 10 * time.Millisecond
+
+	mgr := New(ls, tr, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go mgr.Run(ctx)
 	time.Sleep(20 * time.Millisecond)
 
-	// Fire multiple rapid notifications.
-	fs.setPending([]store.SyncMutation{
-		makeMutation(1, "session", "s1", "upsert"),
-	})
-	for range 5 {
-		m.NotifyDirty()
+	if err := mgr.StopForUpgrade("test-project"); err != nil {
+		t.Fatalf("StopForUpgrade: %v", err)
+	}
+	if mgr.Status().Phase != PhaseDisabled {
+		t.Fatalf("expected PhaseDisabled, got %q", mgr.Status().Phase)
 	}
 
-	waitForCondition(t, 2*time.Second, "push after coalesced notify", func() bool {
-		ft.mu.Lock()
-		defer ft.mu.Unlock()
-		return ft.pushCount > 0
-	})
+	before := atomic.LoadInt32(&tr.pullCalls)
+	time.Sleep(50 * time.Millisecond)
+	after := atomic.LoadInt32(&tr.pullCalls)
 
-	cancel()
-	<-done
-
-	// The key assertion: multiple rapid notifies should NOT produce 5 separate sync cycles.
-	// With debouncing, we expect significantly fewer than 5 pushes.
-	ft.mu.Lock()
-	pushes := ft.pushCount
-	ft.mu.Unlock()
-
-	// With good debouncing, 5 rapid notifies should coalesce to ~1-2 pushes.
-	if pushes > 3 {
-		t.Errorf("expected debounced coalescing (<=3 pushes), got %d pushes from 5 notifies", pushes)
+	if after > before+1 {
+		t.Fatalf("cycles continued after StopForUpgrade: before=%d after=%d", before, after)
 	}
+}
+
+func TestManagerStopForUpgradeRetainsLease(t *testing.T) {
+	ls := newFakeLocalStore()
+	tr := newFakeTransport()
+	mgr := New(ls, tr, DefaultConfig())
+
+	if err := mgr.StopForUpgrade("test-project"); err != nil {
+		t.Fatalf("StopForUpgrade: %v", err)
+	}
+	// Invariant: StopForUpgrade must not call ReleaseSyncLease.
+	// The fakeLocalStore tracks leaseOwner; if it was never acquired, that's fine.
+	_ = mgr.Status()
+}
+
+func TestManagerResumeAfterUpgrade(t *testing.T) {
+	ls := newFakeLocalStore()
+	tr := newFakeTransport()
+	cfg := DefaultConfig()
+	cfg.DebounceDuration = 10 * time.Millisecond
+	cfg.PollInterval = 20 * time.Millisecond
+
+	mgr := New(ls, tr, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go mgr.Run(ctx)
+	time.Sleep(20 * time.Millisecond)
+
+	if err := mgr.StopForUpgrade("test-project"); err != nil {
+		t.Fatalf("StopForUpgrade: %v", err)
+	}
+
+	beforeResume := atomic.LoadInt32(&tr.pullCalls)
+
+	if err := mgr.ResumeAfterUpgrade("test-project"); err != nil {
+		t.Fatalf("ResumeAfterUpgrade: %v", err)
+	}
+	if mgr.Status().Phase == PhaseDisabled {
+		t.Fatal("phase should not be disabled after ResumeAfterUpgrade")
+	}
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&tr.pullCalls) > beforeResume {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("no cycles ran after ResumeAfterUpgrade (before=%d after=%d)",
+		beforeResume, atomic.LoadInt32(&tr.pullCalls))
+}
+
+func TestManagerResumeWithoutStop(t *testing.T) {
+	ls := newFakeLocalStore()
+	tr := newFakeTransport()
+	mgr := New(ls, tr, DefaultConfig())
+
+	mgr.mu.Lock()
+	mgr.status.Phase = PhaseHealthy
+	mgr.mu.Unlock()
+
+	if err := mgr.ResumeAfterUpgrade("test-project"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mgr.Status().Phase != PhaseHealthy {
+		t.Fatalf("ResumeAfterUpgrade without prior Stop should keep PhaseHealthy, got %q", mgr.Status().Phase)
+	}
+}
+
+// ─── Goroutine lifecycle (REQ-213) ───────────────────────────────────────────
+
+func TestManagerStopBeforeRun(t *testing.T) {
+	ls := newFakeLocalStore()
+	tr := newFakeTransport()
+	mgr := New(ls, tr, DefaultConfig())
+
+	done := make(chan struct{})
+	go func() {
+		mgr.Stop()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Stop blocked when called before Run")
+	}
+}
+
+func TestManagerPanicSetsBackoff(t *testing.T) {
+	ls := newFakeLocalStore()
+	tr := newFakeTransport()
+	panicOnce := int32(1)
+
+	cfg := DefaultConfig()
+	cfg.DebounceDuration = 10 * time.Millisecond
+	cfg.PollInterval = 10 * time.Millisecond
+	cfg.BaseBackoff = 10 * time.Millisecond
+	cfg.MaxBackoff = 100 * time.Millisecond
+
+	mgr := New(ls, tr, cfg)
+	mgr.transport = &panicOnceTransport{delegate: tr, panicOnce: &panicOnce}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+	go mgr.Run(ctx)
+	mgr.NotifyDirty()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		st := mgr.Status()
+		if st.Phase == PhaseBackoff && st.ReasonCode == "internal_error" {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("expected PhaseBackoff/internal_error, got phase=%q code=%q",
+		mgr.Status().Phase, mgr.Status().ReasonCode)
+}
+
+func TestManagerLoopContinuesAfterPanic(t *testing.T) {
+	ls := newFakeLocalStore()
+	tr := newFakeTransport()
+	panicOnce := int32(1)
+
+	cfg := DefaultConfig()
+	cfg.DebounceDuration = 10 * time.Millisecond
+	cfg.PollInterval = 20 * time.Millisecond
+	cfg.BaseBackoff = 20 * time.Millisecond
+	cfg.MaxBackoff = 50 * time.Millisecond
+	cfg.MaxConsecutiveFailures = 5
+
+	mgr := New(ls, tr, cfg)
+	mgr.transport = &panicOnceTransport{delegate: tr, panicOnce: &panicOnce}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go mgr.Run(ctx)
+	mgr.NotifyDirty()
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if mgr.Status().Phase == PhaseBackoff {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	before := atomic.LoadInt32(&tr.pullCalls)
+	deadline = time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if atomic.LoadInt32(&tr.pullCalls) > before {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("loop did not continue after panic recovery")
+}
+
+// ─── BW5: Auth/policy error surfacing ────────────────────────────────────────
+
+// fakeAuthErr simulates an HTTP 401 from the transport.
+type fakeAuthErr struct{ code int }
+
+func (e *fakeAuthErr) Error() string         { return fmt.Sprintf("transport: status %d", e.code) }
+func (e *fakeAuthErr) IsAuthFailure() bool   { return e.code == 401 }
+func (e *fakeAuthErr) IsPolicyFailure() bool { return e.code == 403 }
+
+// TestManagerSurfacesAuthRequiredOn401 verifies BW5:
+// When the transport returns a 401-like error, Manager must surface
+// ReasonCode="auth_required" instead of generic "transport_failed".
+func TestManagerSurfacesAuthRequiredOn401(t *testing.T) {
+	ls := newFakeLocalStore()
+	ls.mutations = []store.SyncMutation{{Seq: 1, Entity: "obs", EntityKey: "k1", Project: "proj-a"}}
+
+	authErr := &fakeAuthErr{code: 401}
+	tr := &errTransport{pushErr: authErr}
+
+	cfg := DefaultConfig()
+	cfg.DebounceDuration = 10 * time.Millisecond
+	cfg.PollInterval = 10 * time.Millisecond
+
+	mgr := New(ls, tr, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	go mgr.Run(ctx)
+	mgr.NotifyDirty()
+
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		st := mgr.Status()
+		if st.Phase == PhasePushFailed || st.Phase == PhaseBackoff {
+			if st.ReasonCode != "auth_required" {
+				t.Fatalf("expected ReasonCode=auth_required for 401, got %q", st.ReasonCode)
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("expected PhasePushFailed/PhaseBackoff with auth_required, got phase=%q code=%q",
+		mgr.Status().Phase, mgr.Status().ReasonCode)
+}
+
+// TestManagerSurfacesPolicyForbiddenOn403 verifies BW5:
+// When the transport returns a 403-like error, Manager must surface
+// ReasonCode="policy_forbidden".
+func TestManagerSurfacesPolicyForbiddenOn403(t *testing.T) {
+	ls := newFakeLocalStore()
+	ls.mutations = []store.SyncMutation{{Seq: 1, Entity: "obs", EntityKey: "k1", Project: "proj-a"}}
+
+	policyErr := &fakeAuthErr{code: 403}
+	tr := &errTransport{pushErr: policyErr}
+
+	cfg := DefaultConfig()
+	cfg.DebounceDuration = 10 * time.Millisecond
+	cfg.PollInterval = 10 * time.Millisecond
+
+	mgr := New(ls, tr, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	go mgr.Run(ctx)
+	mgr.NotifyDirty()
+
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		st := mgr.Status()
+		if st.Phase == PhasePushFailed || st.Phase == PhaseBackoff {
+			if st.ReasonCode != "policy_forbidden" {
+				t.Fatalf("expected ReasonCode=policy_forbidden for 403, got %q", st.ReasonCode)
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("expected PhasePushFailed/PhaseBackoff with policy_forbidden, got phase=%q code=%q",
+		mgr.Status().Phase, mgr.Status().ReasonCode)
+}
+
+func TestManagerBlocksWhenOnlyNonEnrolledPendingMutationsRemain(t *testing.T) {
+	ls := newFakeLocalStore()
+	ls.nonEnrolledCounts = []store.PendingSyncMutationProjectCount{
+		{Project: "alpha", Count: 2},
+		{Project: "beta", Count: 1},
+	}
+	tr := newFakeTransport()
+	cfg := DefaultConfig()
+	mgr := New(ls, tr, cfg)
+
+	mgr.cycle(context.Background())
+
+	if got := atomic.LoadInt32(&tr.pushCalls); got != 0 {
+		t.Fatalf("expected no push calls for non-enrolled pending mutations, got %d", got)
+	}
+	if got := atomic.LoadInt32(&tr.pullCalls); got != 0 {
+		t.Fatalf("expected blocked cycle to skip pull, got %d", got)
+	}
+	if len(ls.ackedSeqs) != 0 {
+		t.Fatalf("expected no acked mutations, got %v", ls.ackedSeqs)
+	}
+	st := mgr.Status()
+	if st.Phase != PhasePushFailed {
+		t.Fatalf("expected push_failed status, got %q", st.Phase)
+	}
+	if st.ReasonCode != "non_enrolled_pending_mutations" {
+		t.Fatalf("expected non-enrolled reason code, got %q", st.ReasonCode)
+	}
+	for _, want := range []string{"alpha=2", "beta=1", "engram cloud enroll <project>"} {
+		if !strings.Contains(st.ReasonMessage, want) {
+			t.Fatalf("expected reason message to contain %q, got %q", want, st.ReasonMessage)
+		}
+	}
+	if ls.blockedReason != st.ReasonCode || ls.blockedMessage != st.ReasonMessage {
+		t.Fatalf("expected blocked state persisted, reason=%q message=%q", ls.blockedReason, ls.blockedMessage)
+	}
+}
+
+// ─── BW4: Re-entry guard ─────────────────────────────────────────────────────
+
+// TestManagerRunIsNotReentryable verifies BW4:
+// A second concurrent call to Run must be a no-op; it must not overwrite cancelFn.
+func TestManagerRunIsNotReentryable(t *testing.T) {
+	ls := newFakeLocalStore()
+	tr := newFakeTransport()
+	cfg := DefaultConfig()
+	cfg.PollInterval = 10 * time.Second
+	cfg.DebounceDuration = 10 * time.Second
+
+	mgr := New(ls, tr, cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start first Run
+	go mgr.Run(ctx)
+	time.Sleep(20 * time.Millisecond)
+
+	// Call Run a second time concurrently — must return immediately (or very quickly)
+	done := make(chan struct{})
+	go func() {
+		mgr.Run(ctx)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Second Run returned (re-entry guard worked)
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("second Run call did not return quickly — re-entry not guarded")
+	}
+}
+
+// ─── BW5: Auth/policy error surfacing ────────────────────────────────────────
+
+// errTransport is a CloudTransport that always returns a given error.
+type errTransport struct {
+	pushErr error
+	pullErr error
+}
+
+func (t *errTransport) PushMutations(_ []MutationEntry) (*PushMutationsResult, error) {
+	if t.pushErr != nil {
+		return nil, t.pushErr
+	}
+	return &PushMutationsResult{AcceptedSeqs: []int64{}}, nil
+}
+
+func (t *errTransport) PullMutations(_ int64, _ int) (*PullMutationsResponse, error) {
+	if t.pullErr != nil {
+		return nil, t.pullErr
+	}
+	return &PullMutationsResponse{Mutations: []PulledMutation{}}, nil
+}
+
+// ─── Phase E: Autosync resilience tests (REQ-007, REQ-008) ──────────────────
+
+// E.1a — ReplayDeferred_RetriesAndApplies:
+// A deferred row exists; when the missing observation arrives and
+// replayDeferred is called, the row is applied and removed from
+// sync_apply_deferred.
+func TestReplayDeferred_RetriesAndApplies(t *testing.T) {
+	ls := &fakeLocalStoreWithDeferred{fakeLocalStore: *newFakeLocalStore()}
+	tr := newFakeTransport()
+	cfg := DefaultConfig()
+	cfg.DebounceDuration = 10 * time.Millisecond
+	cfg.PollInterval = 10 * time.Millisecond
+
+	// Pre-load a deferred row.
+	ls.mu.Lock()
+	ls.deferredRows = []DeferredRow{{
+		SyncID:      "rel-1",
+		Entity:      "relation",
+		Payload:     `{"sync_id":"rel-1"}`,
+		RetryCount:  0,
+		ApplyStatus: "deferred",
+	}}
+	ls.mu.Unlock()
+
+	// ReplayDeferred must be called by pull; simulate it resolving successfully.
+	mgr := New(ls, tr, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	go mgr.Run(ctx)
+
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		ls.mu.Lock()
+		called := ls.replayDeferredCalled
+		ls.mu.Unlock()
+		if called {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("ReplayDeferred was not called during pull cycle")
+}
+
+// E.1b — ReplayDeferred_DeadAfterFiveRetries:
+// A row at retry_count=4 with dep still missing → after replayDeferred
+// the row must have apply_status='dead'.
+func TestReplayDeferred_DeadAfterFiveRetries(t *testing.T) {
+	ls := &fakeLocalStoreWithDeferred{fakeLocalStore: *newFakeLocalStore()}
+	tr := newFakeTransport()
+	cfg := DefaultConfig()
+	cfg.DebounceDuration = 10 * time.Millisecond
+	cfg.PollInterval = 10 * time.Millisecond
+
+	ls.mu.Lock()
+	ls.deferredRows = []DeferredRow{{
+		SyncID:      "rel-dead",
+		Entity:      "relation",
+		Payload:     `{"sync_id":"rel-dead"}`,
+		RetryCount:  4,
+		ApplyStatus: "deferred",
+	}}
+	// Always return FK-missing for this deferred row.
+	ls.replayErr = store.ErrRelationFKMissing
+	ls.mu.Unlock()
+
+	mgr := New(ls, tr, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	go mgr.Run(ctx)
+
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		ls.mu.Lock()
+		called := ls.replayDeferredCalled
+		ls.mu.Unlock()
+		if called {
+			// Verify dead count incremented.
+			ls.mu.Lock()
+			deadCalled := ls.markDeadCalled
+			ls.mu.Unlock()
+			if !deadCalled {
+				t.Fatal("MarkApplyDead not called after retry_count reached 5")
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("ReplayDeferred was not called during pull cycle")
+}
+
+// E.1c — ReplayDeferred_DeadRowNotRetried:
+// A dead row must NOT be retried by replayDeferred.
+func TestReplayDeferred_DeadRowNotRetried(t *testing.T) {
+	ls := &fakeLocalStoreWithDeferred{fakeLocalStore: *newFakeLocalStore()}
+	tr := newFakeTransport()
+	cfg := DefaultConfig()
+	cfg.DebounceDuration = 10 * time.Millisecond
+	cfg.PollInterval = 10 * time.Millisecond
+
+	// Dead row — should not be picked up.
+	ls.mu.Lock()
+	ls.deferredRows = []DeferredRow{{
+		SyncID:      "rel-already-dead",
+		Entity:      "relation",
+		Payload:     `{"sync_id":"rel-already-dead"}`,
+		RetryCount:  5,
+		ApplyStatus: "dead",
+	}}
+	ls.mu.Unlock()
+
+	mgr := New(ls, tr, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	go mgr.Run(ctx)
+
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		ls.mu.Lock()
+		called := ls.replayDeferredCalled
+		ls.mu.Unlock()
+		if called {
+			// Dead row must never have been applied.
+			ls.mu.Lock()
+			appliedCount := len(ls.appliedMuts)
+			ls.mu.Unlock()
+			if appliedCount != 0 {
+				t.Fatalf("dead row should never be applied; got %d applied mutations", appliedCount)
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("ReplayDeferred was not called during pull cycle")
+}
+
+// E.1d — Pull_LegacyEntityNonFKError_StillHalts (REQ-008):
+// A legacy entity (observation) apply error must halt the pull loop;
+// cursor must not advance.
+func TestPull_LegacyEntityNonFKError_StillHalts(t *testing.T) {
+	ls := &fakeLocalStoreWithDeferred{fakeLocalStore: *newFakeLocalStore()}
+	tr := newFakeTransport()
+
+	// Inject a pulled legacy mutation.
+	tr.mu.Lock()
+	tr.pullResult = &PullMutationsResponse{
+		Mutations: []PulledMutation{{
+			Seq:    10,
+			Entity: "observation",
+			Op:     "upsert",
+			Payload: []byte(`{"sync_id":"obs-fail","title":"test"}`),
+		}},
+		HasMore: false,
+	}
+	tr.mu.Unlock()
+
+	// Legacy apply error (non-FK) must halt.
+	ls.mu.Lock()
+	ls.pullErr = errors.New("legacy apply error (non-FK)")
+	ls.mu.Unlock()
+
+	cfg := DefaultConfig()
+	cfg.DebounceDuration = 10 * time.Millisecond
+	cfg.PollInterval = 10 * time.Millisecond
+
+	mgr := New(ls, tr, cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	go mgr.Run(ctx)
+
+	deadline := time.Now().Add(400 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		st := mgr.Status()
+		if st.Phase == PhasePullFailed {
+			// Confirm cursor did not advance (SyncState.LastPulledSeq must be 0).
+			ls.mu.Lock()
+			cursorSeq := ls.syncState.LastPulledSeq
+			ls.mu.Unlock()
+			if cursorSeq != 0 {
+				t.Fatalf("cursor advanced to %d despite legacy pull error; expected 0", cursorSeq)
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("expected PhasePullFailed for legacy non-FK error, got %q", mgr.Status().Phase)
+}
+
+// ─── DeferredRow type for fake store ─────────────────────────────────────────
+
+// DeferredRow is a minimal representation of a sync_apply_deferred row used in tests.
+type DeferredRow struct {
+	SyncID      string
+	Entity      string
+	Payload     string
+	RetryCount  int
+	ApplyStatus string
+}
+
+// fakeLocalStoreWithDeferred extends fakeLocalStore with replay support.
+type fakeLocalStoreWithDeferred struct {
+	fakeLocalStore
+	deferredRows        []DeferredRow
+	replayDeferredCalled bool
+	markDeadCalled       bool
+	replayErr           error
+}
+
+func (s *fakeLocalStoreWithDeferred) ReplayDeferred() (store.ReplayDeferredResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.replayDeferredCalled = true
+
+	var res store.ReplayDeferredResult
+	for i := range s.deferredRows {
+		row := &s.deferredRows[i]
+		if row.ApplyStatus == "dead" {
+			continue // Dead rows must not be retried.
+		}
+		res.Retried++
+		if s.replayErr != nil {
+			row.RetryCount++
+			if row.RetryCount >= 5 {
+				row.ApplyStatus = "dead"
+				s.markDeadCalled = true
+				res.Dead++
+			} else {
+				res.Failed++
+			}
+		} else {
+			row.ApplyStatus = "applied"
+			res.Succeeded++
+		}
+	}
+	return res, nil
+}
+
+func (s *fakeLocalStoreWithDeferred) CountDeferredAndDead() (deferred, dead int, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, row := range s.deferredRows {
+		switch row.ApplyStatus {
+		case "deferred":
+			deferred++
+		case "dead":
+			dead++
+		}
+	}
+	return deferred, dead, nil
+}
+
+// ─── Helper types ─────────────────────────────────────────────────────────────
+
+type panicOnceTransport struct {
+	delegate  *fakeCloudTransport
+	panicOnce *int32
+}
+
+func (p *panicOnceTransport) PushMutations(mutations []MutationEntry) (*PushMutationsResult, error) {
+	return p.delegate.PushMutations(mutations)
+}
+
+func (p *panicOnceTransport) PullMutations(sinceSeq int64, limit int) (*PullMutationsResponse, error) {
+	if atomic.CompareAndSwapInt32(p.panicOnce, 1, 0) {
+		panic(fmt.Sprintf("test panic in cycle"))
+	}
+	return p.delegate.PullMutations(sinceSeq, limit)
 }

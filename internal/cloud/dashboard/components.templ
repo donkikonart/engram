@@ -2,6 +2,8 @@ package dashboard
 
 import (
 	"fmt"
+	"net/url"
+
 	"github.com/Gentleman-Programming/engram/internal/cloud/cloudstore"
 )
 
@@ -45,22 +47,93 @@ templ EmptyState(title string, message string) {
 	</div>
 }
 
+// PaginationBar renders page navigation controls with a page-size selector.
+// baseURL is the path without query params (e.g. "/dashboard/projects").
+// extraParams preserves existing query params (project, q, type, etc.).
+templ PaginationBar(pg Pagination, baseURL string, extraParams map[string]string) {
+	if pg.ShowPagination() {
+		<div class="pagination-bar">
+			<span class="pagination-info">{ fmt.Sprintf("%d–%d of %d", pg.Start(), pg.End(), pg.TotalItems) }</span>
+			<div class="pagination-pages">
+				if pg.HasPrev() {
+					<a href={ templ.SafeURL(paginationURL(baseURL, pg.Page-1, pg.PageSize, extraParams)) } class="page-btn">←</a>
+				}
+				for _, n := range pg.PageNumbers() {
+					if n == -1 {
+						<span class="page-ellipsis">…</span>
+					} else if n == pg.Page {
+						<span class="page-btn active">{ fmt.Sprint(n) }</span>
+					} else {
+						<a href={ templ.SafeURL(paginationURL(baseURL, n, pg.PageSize, extraParams)) } class="page-btn">{ fmt.Sprint(n) }</a>
+					}
+				}
+				if pg.HasNext() {
+					<a href={ templ.SafeURL(paginationURL(baseURL, pg.Page+1, pg.PageSize, extraParams)) } class="page-btn">→</a>
+				}
+			</div>
+			<div class="pagination-size">
+				<span class="pagination-size-label">Show</span>
+				for _, size := range allowedPageSizes {
+					if size == pg.PageSize {
+						<span class="page-btn active">{ fmt.Sprint(size) }</span>
+					} else {
+						<a href={ templ.SafeURL(paginationURL(baseURL, 1, size, extraParams)) } class="page-btn">{ fmt.Sprint(size) }</a>
+					}
+				}
+			</div>
+		</div>
+	}
+}
+
+// HtmxPaginationBar is the same but triggers htmx requests instead of full-page navigation.
+// target is the htmx target element (e.g. "#browser-content"), includes are extra hx-include selectors.
+// endpoint must be the bare path WITHOUT a trailing "?" (e.g. "/dashboard/browser/observations").
+// R4-2: URL format uses "?page=..." not "&page=..." to avoid malformed ?& URLs.
+templ HtmxPaginationBar(pg Pagination, endpoint string, target string, includes string) {
+	if pg.ShowPagination() {
+		<div class="pagination-bar">
+			<span class="pagination-info">{ fmt.Sprintf("%d–%d of %d", pg.Start(), pg.End(), pg.TotalItems) }</span>
+			<div class="pagination-pages">
+				if pg.HasPrev() {
+					<a class="page-btn" hx-get={ fmt.Sprintf("%s?page=%d&pageSize=%d", endpoint, pg.Page-1, pg.PageSize) } hx-target={ target } hx-swap="innerHTML" hx-include={ includes }>←</a>
+				}
+				for _, n := range pg.PageNumbers() {
+					if n == -1 {
+						<span class="page-ellipsis">…</span>
+					} else if n == pg.Page {
+						<span class="page-btn active">{ fmt.Sprint(n) }</span>
+					} else {
+						<a class="page-btn" hx-get={ fmt.Sprintf("%s?page=%d&pageSize=%d", endpoint, n, pg.PageSize) } hx-target={ target } hx-swap="innerHTML" hx-include={ includes }>{ fmt.Sprint(n) }</a>
+					}
+				}
+				if pg.HasNext() {
+					<a class="page-btn" hx-get={ fmt.Sprintf("%s?page=%d&pageSize=%d", endpoint, pg.Page+1, pg.PageSize) } hx-target={ target } hx-swap="innerHTML" hx-include={ includes }>→</a>
+				}
+			</div>
+			<div class="pagination-size">
+				<span class="pagination-size-label">Show</span>
+				for _, size := range allowedPageSizes {
+					if size == pg.PageSize {
+						<span class="page-btn active">{ fmt.Sprint(size) }</span>
+					} else {
+						<a class="page-btn" hx-get={ fmt.Sprintf("%s?page=1&pageSize=%d", endpoint, size) } hx-target={ target } hx-swap="innerHTML" hx-include={ includes }>{ fmt.Sprint(size) }</a>
+					}
+				}
+			</div>
+		</div>
+	}
+}
+
 // ─── Phase 4: Dashboard Overview ────────────────────────────────────────────
 
 // DashboardHome renders the main dashboard landing content with project stats.
+// ADAPTED: username comes from Principal.DisplayName() at the call site.
 templ DashboardHome(username string) {
 	<section class="hero-panel">
-		<div class="hero-grid">
-			<div class="hero-copy">
-				<p class="section-kicker">MEMORY FABRIC / OPERATOR { username }</p>
-				<h2>Welcome to Engram Cloud</h2>
-				<p class="hero-lead">Your shared memory workspace is ready. Local SQLite stays authoritative, while cloud turns it into an index your team and agents can actually use.</p>
-			</div>
-			<div class="hero-console">
-				<p><span class="console-key">source</span> local-first SQLite journals</p>
-				<p><span class="console-key">replication</span> cloud-backed mutation stream</p>
-				<p><span class="console-key">access</span> browser dashboard / agent APIs / human review</p>
-			</div>
+		<div class="hero-copy">
+			<p class="section-kicker">OPERATOR { username }</p>
+			<h2>Welcome to Engram Cloud</h2>
+			<p class="hero-lead">Your shared memory workspace is ready. Local SQLite stays authoritative, while cloud turns it into an index your team and agents can actually use.</p>
 		</div>
 		<div class="data-frame" id="dashboard-stats" hx-get="/dashboard/stats" hx-trigger="load" hx-swap="innerHTML">
 			<p class="htmx-indicator terminal-note">Loading stats...</p>
@@ -68,8 +141,9 @@ templ DashboardHome(username string) {
 	</section>
 }
 
-// DashboardStatsPartial renders the project stats table, loaded via htmx.
-templ DashboardStatsPartial(stats []cloudstore.ProjectStat, projects []string) {
+// DashboardStatsPartial renders the metric cards loaded via htmx.
+// ADAPTED: ProjectStat -> DashboardProjectRow; no LastActivity field (use Chunks).
+templ DashboardStatsPartial(stats []cloudstore.DashboardProjectRow, projects []string) {
 	if len(stats) == 0 {
 		<div class="metric-strip">
 			<div class="metric-card">
@@ -79,34 +153,44 @@ templ DashboardStatsPartial(stats []cloudstore.ProjectStat, projects []string) {
 		</div>
 		if len(projects) > 0 {
 			<div class="project-chip-list">
-				for _, p := range projects {
-					@StatusBadge(p, "success")
+				for i, p := range projects {
+					if i < maxPills {
+						@StatusBadge(p, "success")
+					}
+				}
+				if len(projects) > maxPills {
+					<a href="/dashboard/projects" class="badge badge-muted">+{ fmt.Sprint(len(projects) - maxPills) } more</a>
 				}
 			</div>
 		}
 		@EmptyState("No Synced Projects Yet", "Project metrics will show up here after the first successful sync.")
 	} else {
 		<div class="metric-strip">
-			<div class="metric-card">
-				<span class="metric-value">{ fmt.Sprint(totalSessionCount(stats)) }</span>
+			<a href="/dashboard/browser?tab=sessions" class="metric-card stat-card-link">
+				<span class="metric-value">{ fmt.Sprint(totalStatSessions(stats)) }</span>
 				<span class="metric-label">Sessions</span>
-			</div>
-			<div class="metric-card">
-				<span class="metric-value">{ fmt.Sprint(totalObservationCount(stats)) }</span>
+			</a>
+			<a href="/dashboard/browser" class="metric-card stat-card-link">
+				<span class="metric-value">{ fmt.Sprint(totalStatObservations(stats)) }</span>
 				<span class="metric-label">Observations</span>
-			</div>
-			<div class="metric-card">
-				<span class="metric-value">{ fmt.Sprint(totalPromptCount(stats)) }</span>
+			</a>
+			<a href="/dashboard/browser?tab=prompts" class="metric-card stat-card-link">
+				<span class="metric-value">{ fmt.Sprint(totalStatPrompts(stats)) }</span>
 				<span class="metric-label">Prompts</span>
-			</div>
-			<div class="metric-card">
+			</a>
+			<a href="/dashboard/projects" class="metric-card stat-card-link">
 				<span class="metric-value">{ fmt.Sprint(len(stats)) }</span>
 				<span class="metric-label">Projects Synced</span>
-			</div>
+			</a>
 		</div>
 		<div class="project-chip-list metric-tags">
-			for _, p := range projects {
-				@StatusBadge(p, "success")
+			for i, p := range projects {
+				if i < maxPills {
+					@StatusBadge(p, "success")
+				}
+			}
+			if len(projects) > maxPills {
+				<a href="/dashboard/projects" class="badge badge-muted">+{ fmt.Sprint(len(projects) - maxPills) } more</a>
 			}
 		</div>
 		<div class="section-header compact">
@@ -115,6 +199,34 @@ templ DashboardStatsPartial(stats []cloudstore.ProjectStat, projects []string) {
 				<h3>Project Activity</h3>
 			</div>
 		</div>
+		<div class="browser-controls">
+			<input
+				id="activity-search"
+				type="search"
+				name="q"
+				placeholder="Search projects..."
+				hx-get="/dashboard/activity"
+				hx-target="#activity-content"
+				hx-swap="innerHTML"
+				hx-trigger="keyup changed delay:300ms"
+			/>
+		</div>
+		<div id="activity-content"
+			hx-get="/dashboard/activity"
+			hx-trigger="load"
+			hx-swap="innerHTML"
+			hx-include="#activity-search">
+			<p class="muted">Loading...</p>
+		</div>
+	}
+}
+
+// DashboardActivityPartial renders the project activity table, loaded via htmx.
+// ADAPTED: ProjectStat -> DashboardProjectRow; no LastActivity (omit that column).
+templ DashboardActivityPartial(stats []cloudstore.DashboardProjectRow, pg Pagination) {
+	if len(stats) == 0 {
+		@EmptyState("No Activity", "No projects match the current search.")
+	} else {
 		<table class="data-table">
 			<thead>
 				<tr>
@@ -122,25 +234,17 @@ templ DashboardStatsPartial(stats []cloudstore.ProjectStat, projects []string) {
 					<th>Sessions</th>
 					<th>Observations</th>
 					<th>Prompts</th>
-					<th>Last Activity</th>
 				</tr>
 			</thead>
 			<tbody>
 				for _, s := range stats {
 					<tr>
 						<td>
-							<a href={ templ.SafeURL("/dashboard/projects/" + s.Project) }>{ s.Project }</a>
+							<a href={ templ.SafeURL("/dashboard/projects/" + url.PathEscape(s.Project)) }>{ s.Project }</a>
 						</td>
-						<td>{ fmt.Sprint(s.SessionCount) }</td>
-						<td>{ fmt.Sprint(s.ObservationCount) }</td>
-						<td>{ fmt.Sprint(s.PromptCount) }</td>
-						<td>
-							if s.LastActivity != nil {
-								{ formatTimestampPtr(s.LastActivity) }
-							} else {
-								<span class="muted">—</span>
-							}
-						</td>
+						<td>{ fmt.Sprint(s.Sessions) }</td>
+						<td>{ fmt.Sprint(s.Observations) }</td>
+						<td>{ fmt.Sprint(s.Prompts) }</td>
 					</tr>
 				}
 			</tbody>
@@ -192,22 +296,25 @@ templ BrowserPage(projects []string, types []string, activeProject string, searc
 				}
 			</div>
 		}
-		<div class="browser-subtabs" role="tablist">
+		<div class="browser-subtabs" role="tablist" id="browser-tabs">
 			<a role="tab" aria-selected="true" class="active"
 				hx-get="/dashboard/browser/observations"
 				hx-target="#browser-content"
 				hx-swap="innerHTML"
-				hx-include="#browser-project, #browser-search, #browser-type">Observations</a>
+				hx-include="#browser-project, #browser-search, #browser-type"
+				hx-on::after-request="document.querySelectorAll('#browser-tabs [role=tab]').forEach(t=>t.classList.remove('active'));this.classList.add('active')">Observations</a>
 			<a role="tab" aria-selected="false"
 				hx-get="/dashboard/browser/sessions"
 				hx-target="#browser-content"
 				hx-swap="innerHTML"
-				hx-include="#browser-project, #browser-search, #browser-type">Sessions</a>
+				hx-include="#browser-project, #browser-search, #browser-type"
+				hx-on::after-request="document.querySelectorAll('#browser-tabs [role=tab]').forEach(t=>t.classList.remove('active'));this.classList.add('active')">Sessions</a>
 			<a role="tab" aria-selected="false"
 				hx-get="/dashboard/browser/prompts"
 				hx-target="#browser-content"
 				hx-swap="innerHTML"
-				hx-include="#browser-project, #browser-search, #browser-type">Prompts</a>
+				hx-include="#browser-project, #browser-search, #browser-type"
+				hx-on::after-request="document.querySelectorAll('#browser-tabs [role=tab]').forEach(t=>t.classList.remove('active'));this.classList.add('active')">Prompts</a>
 		</div>
 		<div class="browser-content-frame" id="browser-content" hx-get="/dashboard/browser/observations" hx-trigger="load" hx-swap="innerHTML" hx-include="#browser-project, #browser-search, #browser-type">
 			<p class="htmx-indicator">Loading...</p>
@@ -216,100 +323,104 @@ templ BrowserPage(projects []string, types []string, activeProject string, searc
 }
 
 // ObservationsPartial renders the observations list, loaded as an htmx partial.
-templ ObservationsPartial(observations []cloudstore.CloudObservation) {
+// ADAPTED: CloudObservation -> DashboardObservationRow; composite URL for detail page.
+// R3-1: HtmxPaginationBar added so users have visible page controls in the browser.
+templ ObservationsPartial(observations []cloudstore.DashboardObservationRow, pg Pagination) {
 	if len(observations) == 0 {
 		@EmptyState("No Observations", "No observations match the current project, search text, or type filter.")
 	} else {
 		<div class="observation-list">
 			for _, o := range observations {
-				<article class="card">
-					<header>
-						<strong><a href={ templ.SafeURL(fmt.Sprintf("/dashboard/observations/%d", o.ID)) }>{ o.Title }</a></strong>
-						@StatusBadge(o.Type, typeBadgeVariant(o.Type))
-						if o.Project != nil {
-							@StatusBadge(*o.Project, "muted")
-						}
-					</header>
-					<p>{ renderInlineStructuredPreview(o.Content, 220) }</p>
-					<footer>
-						<small>{ formatTimestamp(o.CreatedAt) }</small>
-						<small>Scope: { o.Scope }</small>
-						<small><a href={ templ.SafeURL("/dashboard/sessions/" + o.SessionID) }>Session { o.SessionID }</a></small>
-					</footer>
-				</article>
+				<a href={ templ.SafeURL(fmt.Sprintf("/dashboard/observations/%s/%s/%s", url.PathEscape(o.Project), url.PathEscape(o.SessionID), url.PathEscape(o.SyncID))) } class="card-link">
+					<article class="card">
+						<header>
+							<strong>{ o.Title }</strong>
+							@StatusBadge(o.Type, typeBadgeVariant(o.Type))
+							@StatusBadge(o.Project, "muted")
+						</header>
+						<p>{ renderInlineStructuredPreview(o.Content, 220) }</p>
+						<footer>
+							<small>{ formatTimestamp(o.CreatedAt) }</small>
+							<small>Session { o.SessionID }</small>
+						</footer>
+					</article>
+				</a>
 			}
 		</div>
+		@HtmxPaginationBar(pg, "/dashboard/browser/observations", "#browser-content", "#browser-project, #browser-search, #browser-type")
 	}
 }
 
 // SessionsPartial renders the sessions list, loaded as an htmx partial.
-templ SessionsPartial(sessions []cloudstore.CloudSessionSummary) {
+// ADAPTED: CloudSessionSummary -> DashboardSessionRow; composite URL for detail page.
+// R3-1: HtmxPaginationBar added so users have visible page controls in the browser.
+templ SessionsPartial(sessions []cloudstore.DashboardSessionRow, pg Pagination) {
 	if len(sessions) == 0 {
 		@EmptyState("No Sessions", "No sessions match the current project or search filter.")
 	} else {
-		<table class="data-table">
-			<thead>
-				<tr>
-					<th>Project</th>
-					<th>Started</th>
-					<th>Ended</th>
-					<th>Observations</th>
-					<th>Summary</th>
-				</tr>
-			</thead>
-			<tbody>
-				for _, s := range sessions {
+		<div class="table-scroll">
+			<table class="data-table">
+				<thead>
 					<tr>
-						<td>
-							<a href={ templ.SafeURL("/dashboard/sessions/" + s.ID) }>{ s.Project }</a>
-							<div class="muted">session { s.ID }</div>
-						</td>
-						<td>{ formatTimestamp(s.StartedAt) }</td>
-						<td>
-							if s.EndedAt != nil {
-								{ formatTimestampPtr(s.EndedAt) }
-							} else {
-								@StatusBadge("Active", "success")
-							}
-						</td>
-						<td>{ fmt.Sprint(s.ObservationCount) }</td>
-						<td>
-							if s.Summary != nil {
-								{ truncateContent(*s.Summary, 100) }
-							} else {
-								<span class="muted">—</span>
-							}
-						</td>
+						<th>Project</th>
+						<th>Started</th>
+						<th>Ended</th>
+						<th>Summary</th>
 					</tr>
-				}
-			</tbody>
-		</table>
+				</thead>
+				<tbody>
+					for _, s := range sessions {
+						<tr>
+							<td>
+								<a href={ templ.SafeURL("/dashboard/sessions/" + url.PathEscape(s.Project) + "/" + url.PathEscape(s.SessionID)) }>{ s.Project }</a>
+								<div class="muted">session { s.SessionID }</div>
+							</td>
+							<td>{ formatTimestamp(s.StartedAt) }</td>
+							<td>
+								if s.EndedAt != "" {
+									{ formatTimestamp(s.EndedAt) }
+								} else {
+									@StatusBadge("Active", "success")
+								}
+							</td>
+							<td>{ truncateContent(s.Summary, 100) }</td>
+						</tr>
+					}
+				</tbody>
+			</table>
+		</div>
+		@HtmxPaginationBar(pg, "/dashboard/browser/sessions", "#browser-content", "#browser-project, #browser-search, #browser-type")
 	}
 }
 
 // PromptsPartial renders the prompts list, loaded as an htmx partial.
-templ PromptsPartial(prompts []cloudstore.CloudPrompt) {
+// ADAPTED: CloudPrompt -> DashboardPromptRow; composite URL for detail page.
+// R3-1: HtmxPaginationBar added so users have visible page controls in the browser.
+templ PromptsPartial(prompts []cloudstore.DashboardPromptRow, pg Pagination) {
 	if len(prompts) == 0 {
 		@EmptyState("No Prompts", "No prompts match the current project or search filter.")
 	} else {
 		<div class="prompt-list">
 			for _, p := range prompts {
-				<article class="card">
-					<p><a href={ templ.SafeURL(fmt.Sprintf("/dashboard/prompts/%d", p.ID)) }>{ truncateContent(p.Content, 300) }</a></p>
-					<footer>
-						<small>{ formatTimestamp(p.CreatedAt) }</small>
-						<small><a href={ templ.SafeURL("/dashboard/sessions/" + p.SessionID) }>Session { p.SessionID }</a></small>
-						if p.Project != "" {
+				<a href={ templ.SafeURL(fmt.Sprintf("/dashboard/prompts/%s/%s/%s", url.PathEscape(p.Project), url.PathEscape(p.SessionID), url.PathEscape(p.SyncID))) } class="card-link">
+					<article class="card">
+						<p>{ truncateContent(p.Content, 300) }</p>
+						<footer>
+							<small>{ formatTimestamp(p.CreatedAt) }</small>
+							<small>Session { p.SessionID }</small>
 							@StatusBadge(p.Project, "muted")
-						}
-					</footer>
-				</article>
+						</footer>
+					</article>
+				</a>
 			}
 		</div>
+		@HtmxPaginationBar(pg, "/dashboard/browser/prompts", "#browser-content", "#browser-project, #browser-search, #browser-type")
 	}
 }
 
-templ PromptDetailPage(prompt *cloudstore.CloudPrompt, session *cloudstore.CloudSession, related []cloudstore.CloudPrompt) {
+// PromptDetailPage renders a prompt detail page.
+// ADAPTED: CloudPrompt -> DashboardPromptRow; CloudSession -> DashboardSessionRow.
+templ PromptDetailPage(prompt *cloudstore.DashboardPromptRow, session *cloudstore.DashboardSessionRow, related []cloudstore.DashboardPromptRow) {
 	<section class="frame-section">
 		<div class="section-header">
 			<div>
@@ -323,8 +434,8 @@ templ PromptDetailPage(prompt *cloudstore.CloudPrompt, session *cloudstore.Cloud
 			<div class="data-frame observation-detail-body">
 				<table class="data-table">
 					<tbody>
-						<tr><th>Prompt ID</th><td>{ fmt.Sprint(prompt.ID) }</td></tr>
-						<tr><th>Session</th><td><a href={ templ.SafeURL("/dashboard/sessions/" + prompt.SessionID) }>{ prompt.SessionID }</a></td></tr>
+						<tr><th>Chunk ID</th><td>{ prompt.ChunkID }</td></tr>
+						<tr><th>Session</th><td><a href={ templ.SafeURL("/dashboard/sessions/" + url.PathEscape(prompt.Project) + "/" + url.PathEscape(prompt.SessionID)) }>{ prompt.SessionID }</a></td></tr>
 						<tr><th>Project</th><td>{ prompt.Project }</td></tr>
 						<tr><th>Created</th><td>{ formatTimestamp(prompt.CreatedAt) }</td></tr>
 					</tbody>
@@ -337,13 +448,13 @@ templ PromptDetailPage(prompt *cloudstore.CloudPrompt, session *cloudstore.Cloud
 			if session != nil {
 				<div class="data-frame linked-session-panel">
 					<p class="section-kicker">LINKED SESSION</p>
-					<h3><a href={ templ.SafeURL("/dashboard/sessions/" + session.ID) }>{ session.Project }</a></h3>
+					<h3><a href={ templ.SafeURL("/dashboard/sessions/" + url.PathEscape(session.Project) + "/" + url.PathEscape(session.SessionID)) }>{ session.Project }</a></h3>
 					<p class="muted">Started { formatTimestamp(session.StartedAt) }</p>
 				</div>
 			}
 			if len(related) > 0 {
 				<h3 class="section-block-title">Other Prompts from this Session</h3>
-				@PromptsPartial(related)
+				@PromptsPartial(related, Pagination{})
 			}
 		}
 	</section>
@@ -352,7 +463,7 @@ templ PromptDetailPage(prompt *cloudstore.CloudPrompt, session *cloudstore.Cloud
 // ─── Phase 6: Projects Tab ──────────────────────────────────────────────────
 
 // ProjectsPage renders the projects list view.
-templ ProjectsPage(stats []cloudstore.ProjectStat, controls map[string]cloudstore.ProjectSyncControl) {
+templ ProjectsPage(search string) {
 	<section class="frame-section">
 		<div class="section-header">
 			<div>
@@ -360,31 +471,57 @@ templ ProjectsPage(stats []cloudstore.ProjectStat, controls map[string]cloudstor
 				<h2>Projects</h2>
 			</div>
 		</div>
-		if len(stats) == 0 {
-			@EmptyState("No Projects", "Projects will appear here once data is synced.")
-		} else {
-			<div class="project-grid">
-				for _, s := range stats {
+		<div class="browser-controls">
+			<input
+				id="project-search"
+				type="search"
+				name="q"
+				placeholder="Search projects..."
+				value={ search }
+				hx-get="/dashboard/projects/list"
+				hx-target="#projects-content"
+				hx-swap="innerHTML"
+				hx-trigger="keyup changed delay:300ms"
+			/>
+		</div>
+		<div id="projects-content"
+			hx-get="/dashboard/projects/list"
+			hx-trigger="load"
+			hx-swap="innerHTML"
+			hx-include="#project-search">
+			<p class="muted">Loading...</p>
+		</div>
+	</section>
+}
+
+// ProjectsListPartial renders the project cards grid, loaded via htmx.
+// ADAPTED: ProjectStat -> DashboardProjectRow; ProjectSyncControl kept (now in integrated cloudstore).
+// R4-3: HtmxPaginationBar added so users can navigate beyond the first page.
+templ ProjectsListPartial(stats []cloudstore.DashboardProjectRow, controls map[string]cloudstore.ProjectSyncControl, pg Pagination) {
+	if len(stats) == 0 {
+		@EmptyState("No Projects", "No projects match the current search.")
+	} else {
+		<div class="project-grid">
+			for _, s := range stats {
+				<a href={ templ.SafeURL("/dashboard/projects/" + url.PathEscape(s.Project)) } class="card-link">
 					<article class="card project-card">
 						<header>
-							<h3>
-								<a href={ templ.SafeURL("/dashboard/projects/" + s.Project) }>{ s.Project }</a>
-							</h3>
+							<h3>{ s.Project }</h3>
 							if !projectControl(controls, s.Project).SyncEnabled {
 								@StatusBadge("Paused", "danger")
 							}
 						</header>
 						<div class="project-stats">
 							<div class="stat">
-								<span class="stat-value">{ fmt.Sprint(s.SessionCount) }</span>
+								<span class="stat-value">{ fmt.Sprint(s.Sessions) }</span>
 								<span class="stat-label">Sessions</span>
 							</div>
 							<div class="stat">
-								<span class="stat-value">{ fmt.Sprint(s.ObservationCount) }</span>
+								<span class="stat-value">{ fmt.Sprint(s.Observations) }</span>
 								<span class="stat-label">Observations</span>
 							</div>
 							<div class="stat">
-								<span class="stat-value">{ fmt.Sprint(s.PromptCount) }</span>
+								<span class="stat-value">{ fmt.Sprint(s.Prompts) }</span>
 								<span class="stat-label">Prompts</span>
 							</div>
 						</div>
@@ -392,19 +529,18 @@ templ ProjectsPage(stats []cloudstore.ProjectStat, controls map[string]cloudstor
 							if !projectControl(controls, s.Project).SyncEnabled && projectControl(controls, s.Project).PausedReason != nil {
 								<small>Paused: { *projectControl(controls, s.Project).PausedReason }</small>
 							}
-							if s.LastActivity != nil {
-								<small>Last activity: { formatTimestampPtr(s.LastActivity) }</small>
-							}
 						</footer>
 					</article>
-				}
-			</div>
-		}
-	</section>
+				</a>
+			}
+		</div>
+		@HtmxPaginationBar(pg, "/dashboard/projects/list", "#projects-content", "#project-search")
+	}
 }
 
 // ProjectDetailPage renders the detail view for a single project.
-templ ProjectDetailPage(project string, stats *cloudstore.ProjectStat, control *cloudstore.ProjectSyncControl, sessions []cloudstore.CloudSessionSummary, observations []cloudstore.CloudObservation, prompts []cloudstore.CloudPrompt) {
+// ADAPTED: ProjectStat -> DashboardProjectRow; ProjectSyncControl kept.
+templ ProjectDetailPage(project string, stats *cloudstore.DashboardProjectRow, control *cloudstore.ProjectSyncControl) {
 	<section class="frame-section">
 		<div class="section-header">
 			<div>
@@ -439,32 +575,84 @@ templ ProjectDetailPage(project string, stats *cloudstore.ProjectStat, control *
 		if stats != nil {
 			<div class="dashboard-grid">
 				<div class="stat-card">
-					<span class="stat-value">{ fmt.Sprint(stats.SessionCount) }</span>
+					<span class="stat-value">{ fmt.Sprint(stats.Sessions) }</span>
 					<span class="stat-label">Sessions</span>
 				</div>
 				<div class="stat-card">
-					<span class="stat-value">{ fmt.Sprint(stats.ObservationCount) }</span>
+					<span class="stat-value">{ fmt.Sprint(stats.Observations) }</span>
 					<span class="stat-label">Observations</span>
 				</div>
 				<div class="stat-card">
-					<span class="stat-value">{ fmt.Sprint(stats.PromptCount) }</span>
+					<span class="stat-value">{ fmt.Sprint(stats.Prompts) }</span>
 					<span class="stat-label">Prompts</span>
 				</div>
 			</div>
 		}
-		<h3 class="section-block-title">Recent Sessions</h3>
-		@SessionsPartial(sessions)
-		<h3 class="section-block-title">Recent Observations</h3>
-		@ObservationsPartial(observations)
-		<h3 class="section-block-title">Recent Prompts</h3>
-		@PromptsPartial(prompts)
+		<div class="browser-subtabs" role="tablist" id="project-tabs">
+			<a role="tab" aria-selected="true" class="active"
+				hx-get={ fmt.Sprintf("/dashboard/projects/%s/observations", url.PathEscape(project)) }
+				hx-target="#project-content"
+				hx-swap="innerHTML"
+				hx-on::after-request="document.querySelectorAll('#project-tabs [role=tab]').forEach(t=>t.classList.remove('active'));this.classList.add('active')">Observations</a>
+			<a role="tab" aria-selected="false"
+				hx-get={ fmt.Sprintf("/dashboard/projects/%s/sessions", url.PathEscape(project)) }
+				hx-target="#project-content"
+				hx-swap="innerHTML"
+				hx-on::after-request="document.querySelectorAll('#project-tabs [role=tab]').forEach(t=>t.classList.remove('active'));this.classList.add('active')">Sessions</a>
+			<a role="tab" aria-selected="false"
+				hx-get={ fmt.Sprintf("/dashboard/projects/%s/prompts", url.PathEscape(project)) }
+				hx-target="#project-content"
+				hx-swap="innerHTML"
+				hx-on::after-request="document.querySelectorAll('#project-tabs [role=tab]').forEach(t=>t.classList.remove('active'));this.classList.add('active')">Prompts</a>
+		</div>
+		<div class="browser-content-frame" id="project-content"
+			hx-get={ fmt.Sprintf("/dashboard/projects/%s/observations", url.PathEscape(project)) }
+			hx-trigger="load"
+			hx-swap="innerHTML">
+			<p class="muted">Loading...</p>
+		</div>
 	</section>
 }
 
 // ─── Phase 7: Contributors Tab ──────────────────────────────────────────────
 
-// ContributorsPage renders the contributors list view.
-templ ContributorsPage(contributors []cloudstore.ContributorStat) {
+// ContributorsListPartial renders the contributors table + HtmxPaginationBar only (no shell, no outer wrapper).
+// R5-2: used by /dashboard/contributors/list so HTMX pagination works without full-page nav.
+// R6-1: outer <div id="contributors-content"> removed — HTMX swaps innerHTML into the existing
+//
+//	shell div, so re-wrapping in the same ID would create duplicate IDs in the DOM.
+templ ContributorsListPartial(contributors []cloudstore.DashboardContributorRow, pg Pagination) {
+	if len(contributors) == 0 {
+		@EmptyState("No Contributors Yet", "Contributor activity will appear once team members start syncing.")
+	} else {
+		<table class="data-table">
+			<thead>
+				<tr>
+					<th>Contributor</th>
+					<th>Chunks</th>
+					<th>Projects</th>
+					<th>Last Chunk</th>
+				</tr>
+			</thead>
+			<tbody>
+				for _, c := range contributors {
+					<tr>
+						<td><a href={ templ.SafeURL("/dashboard/contributors/" + url.PathEscape(c.CreatedBy)) }>{ c.CreatedBy }</a></td>
+						<td>{ fmt.Sprint(c.Chunks) }</td>
+						<td>{ fmt.Sprint(c.Projects) }</td>
+						<td>{ formatTimestampStr(c.LastChunkAt) }</td>
+					</tr>
+				}
+			</tbody>
+		</table>
+		@HtmxPaginationBar(pg, "/dashboard/contributors/list", "#contributors-content", "")
+	}
+}
+
+// ContributorsPage renders the contributors list shell.
+// R6-1: converted to hx-get/load pattern (mirrors ProjectsPage) — the inline table is removed.
+// The outer #contributors-content div triggers an HTMX load of /dashboard/contributors/list.
+templ ContributorsPage(search string) {
 	<section class="frame-section">
 		<div class="section-header">
 			<div>
@@ -472,82 +660,99 @@ templ ContributorsPage(contributors []cloudstore.ContributorStat) {
 				<h2>Contributors</h2>
 			</div>
 		</div>
-		if len(contributors) == 0 {
-			@EmptyState("No Contributors Yet", "Contributor activity will appear once team members start syncing.")
-		} else {
-		<table class="data-table">
-				<thead>
-					<tr>
-						<th>Username</th>
-						<th>Email</th>
-						<th>Sessions</th>
-						<th>Observations</th>
-						<th>Last Sync</th>
-					</tr>
-				</thead>
-				<tbody>
-					for _, c := range contributors {
-						<tr>
-							<td><a href={ templ.SafeURL("/dashboard/contributors/" + c.UserID) }>{ c.Username }</a></td>
-							<td>{ c.Email }</td>
-							<td>{ fmt.Sprint(c.SessionCount) }</td>
-							<td>{ fmt.Sprint(c.ObservationCount) }</td>
-						<td>
-							if c.LastSync != nil {
-								{ formatTimestampPtr(c.LastSync) }
-							} else {
-								<span class="muted">Never</span>
-								}
-							</td>
-						</tr>
-					}
-				</tbody>
-			</table>
-		}
+		<div class="browser-controls">
+			<input
+				id="contributor-search"
+				type="search"
+				name="q"
+				placeholder="Search contributors..."
+				value={ search }
+				hx-get="/dashboard/contributors/list"
+				hx-target="#contributors-content"
+				hx-swap="innerHTML"
+				hx-trigger="keyup changed delay:300ms"
+			/>
+		</div>
+		<div id="contributors-content"
+			hx-get="/dashboard/contributors/list"
+			hx-trigger="load"
+			hx-swap="innerHTML"
+			hx-include="#contributor-search">
+			<p class="muted">Loading...</p>
+		</div>
 	</section>
 }
 
-templ ContributorDetailPage(user *cloudstore.CloudUser, contributor *cloudstore.ContributorStat, sessions []cloudstore.CloudSessionSummary, observations []cloudstore.CloudObservation, prompts []cloudstore.CloudPrompt) {
+// ContributorDetailPage renders contributor detail.
+// ADAPTED: ContributorStat -> DashboardContributorRow.
+// R4-8: displayName parameter removed — it was passed but never used in the template body.
+templ ContributorDetailPage(contributor *cloudstore.DashboardContributorRow, sessions []cloudstore.DashboardSessionRow, observations []cloudstore.DashboardObservationRow, prompts []cloudstore.DashboardPromptRow) {
 	<section class="frame-section">
 		<div class="section-header">
 			<div>
 				<p class="section-kicker">CONTRIBUTOR DETAIL</p>
-				if user != nil {
-					<h2>{ user.Username }</h2>
+				if contributor != nil {
+					<h2>{ contributor.CreatedBy }</h2>
 				} else {
 					<h2>Contributor</h2>
 				}
 			</div>
 		</div>
-		if user == nil || contributor == nil {
+		if contributor == nil {
 			@EmptyState("Contributor Not Found", "This contributor does not exist or is outside your current org view.")
 		} else {
 			<div class="dashboard-grid">
-				<div class="stat-card"><span class="stat-value">{ fmt.Sprint(contributor.SessionCount) }</span><span class="stat-label">Sessions</span></div>
-				<div class="stat-card"><span class="stat-value">{ fmt.Sprint(contributor.ObservationCount) }</span><span class="stat-label">Observations</span></div>
-				<div class="stat-card"><span class="stat-value stat-copy">{ formatTimestamp(user.CreatedAt) }</span><span class="stat-label">Joined</span></div>
-			</div>
-			<div class="data-frame session-meta">
-				<table class="data-table"><tbody>
-					<tr><th>Username</th><td>{ user.Username }</td></tr>
-					<tr><th>Email</th><td>{ user.Email }</td></tr>
-					<tr><th>Last Sync</th><td>{ formatTimestampPtr(contributor.LastSync) }</td></tr>
-				</tbody></table>
+				<a href={ templ.SafeURL("/dashboard/browser?q=" + url.QueryEscape(contributor.CreatedBy)) } class="stat-card stat-card-link"><span class="stat-value">{ fmt.Sprint(contributor.Chunks) }</span><span class="stat-label">Chunks</span></a>
+				<a href={ templ.SafeURL("/dashboard/projects?q=" + url.QueryEscape(contributor.CreatedBy)) } class="stat-card stat-card-link"><span class="stat-value">{ fmt.Sprint(contributor.Projects) }</span><span class="stat-label">Projects</span></a>
+				<div class="stat-card"><span class="stat-value stat-copy">{ formatTimestampStr(contributor.LastChunkAt) }</span><span class="stat-label">Last Chunk</span></div>
 			</div>
 			<h3 class="section-block-title">Recent Sessions</h3>
-			@SessionsPartial(sessions)
+			@SessionsPartial(sessions, Pagination{})
 			<h3 class="section-block-title">Recent Observations</h3>
-			@ObservationsPartial(observations)
+			@ObservationsPartial(observations, Pagination{})
 			<h3 class="section-block-title">Recent Prompts</h3>
-			@PromptsPartial(prompts)
+			@PromptsPartial(prompts, Pagination{})
 		}
 	</section>
 }
 
 // ─── Phase 8: Admin Views ───────────────────────────────────────────────────
 
+// adminNav renders the shared admin sub-navigation bar.
+// active should be one of: "overview", "projects", "users", "health", "audit-log".
+templ adminNav(active string) {
+	<div class="admin-nav">
+		if active == "overview" {
+			<a href="/dashboard/admin" class="active">Overview</a>
+		} else {
+			<a href="/dashboard/admin">Overview</a>
+		}
+		if active == "projects" {
+			<a href="/dashboard/admin/projects" class="active">Projects</a>
+		} else {
+			<a href="/dashboard/admin/projects">Projects</a>
+		}
+		if active == "users" {
+			<a href="/dashboard/admin/users" class="active">Users</a>
+		} else {
+			<a href="/dashboard/admin/users">Users</a>
+		}
+		if active == "health" {
+			<a href="/dashboard/admin/health" class="active">System Health</a>
+		} else {
+			<a href="/dashboard/admin/health">System Health</a>
+		}
+		if active == "audit-log" {
+			<a href="/dashboard/admin/audit-log" class="active">Audit Log</a>
+		} else {
+			<a href="/dashboard/admin/audit-log">Audit Log</a>
+		}
+	</div>
+}
+
 // AdminPage renders the admin dashboard landing with sub-navigation.
-templ AdminPage(health *cloudstore.SystemHealthInfo, controls []cloudstore.ProjectSyncControl) {
+// ADAPTED: SystemHealthInfo -> DashboardSystemHealth; ProjectSyncControl kept.
+templ AdminPage(health *cloudstore.DashboardSystemHealth, controls []cloudstore.ProjectSyncControl) {
 	<section class="frame-section">
 		<div class="section-header">
 			<div>
@@ -555,12 +760,7 @@ templ AdminPage(health *cloudstore.SystemHealthInfo, controls []cloudstore.Proje
 				<h2>Admin Overview</h2>
 			</div>
 		</div>
-		<div class="admin-nav">
-			<a href="/dashboard/admin" class="active">Overview</a>
-			<a href="/dashboard/admin/projects">Projects</a>
-			<a href="/dashboard/admin/users">Users</a>
-			<a href="/dashboard/admin/health">System Health</a>
-		</div>
+		@adminNav("overview")
 		if health != nil {
 			<div class="dashboard-grid">
 				<div class="stat-card">
@@ -574,24 +774,24 @@ templ AdminPage(health *cloudstore.SystemHealthInfo, controls []cloudstore.Proje
 					<span class="stat-label">Database</span>
 				</div>
 				<div class="stat-card">
-					<span class="stat-value">{ fmt.Sprint(health.TotalUsers) }</span>
-					<span class="stat-label">Users</span>
+					<span class="stat-value">{ fmt.Sprint(health.Contributors) }</span>
+					<span class="stat-label">Contributors</span>
 				</div>
 				<div class="stat-card">
-					<span class="stat-value">{ fmt.Sprint(health.TotalSessions) }</span>
+					<span class="stat-value">{ fmt.Sprint(health.Sessions) }</span>
 					<span class="stat-label">Sessions</span>
 				</div>
 				<div class="stat-card">
-					<span class="stat-value">{ fmt.Sprint(health.TotalMemories) }</span>
-					<span class="stat-label">Memories</span>
+					<span class="stat-value">{ fmt.Sprint(health.Observations) }</span>
+					<span class="stat-label">Observations</span>
 				</div>
 				<div class="stat-card">
-					<span class="stat-value">{ fmt.Sprint(health.TotalPrompts) }</span>
+					<span class="stat-value">{ fmt.Sprint(health.Prompts) }</span>
 					<span class="stat-label">Prompts</span>
 				</div>
 				<div class="stat-card">
-					<span class="stat-value">{ fmt.Sprint(health.TotalMutations) }</span>
-					<span class="stat-label">Mutations</span>
+					<span class="stat-value">{ fmt.Sprint(health.Projects) }</span>
+					<span class="stat-label">Projects</span>
 				</div>
 				<div class="stat-card">
 					<span class="stat-value">{ fmt.Sprint(countPausedProjects(controls)) }</span>
@@ -603,6 +803,7 @@ templ AdminPage(health *cloudstore.SystemHealthInfo, controls []cloudstore.Proje
 }
 
 // AdminProjectsPage renders organization-level project sync controls.
+// ADAPTED: ProjectSyncControl kept (integrated cloudstore now has it).
 templ AdminProjectsPage(controls []cloudstore.ProjectSyncControl) {
 	<section class="frame-section">
 		<div class="section-header">
@@ -611,12 +812,7 @@ templ AdminProjectsPage(controls []cloudstore.ProjectSyncControl) {
 				<h2>Project Controls</h2>
 			</div>
 		</div>
-		<div class="admin-nav">
-			<a href="/dashboard/admin">Overview</a>
-			<a href="/dashboard/admin/projects" class="active">Projects</a>
-			<a href="/dashboard/admin/users">Users</a>
-			<a href="/dashboard/admin/health">System Health</a>
-		</div>
+		@adminNav("projects")
 		if len(controls) == 0 {
 			@EmptyState("No Managed Projects", "Projects appear here once cloud receives data or policy entries.")
 		} else {
@@ -634,7 +830,7 @@ templ AdminProjectsPage(controls []cloudstore.ProjectSyncControl) {
 				<tbody>
 					for _, control := range controls {
 						<tr>
-							<td><a href={ templ.SafeURL("/dashboard/projects/" + control.Project) }>{ control.Project }</a></td>
+							<td><a href={ templ.SafeURL("/dashboard/projects/" + url.PathEscape(control.Project)) }>{ control.Project }</a></td>
 							<td>
 								if control.SyncEnabled {
 									@StatusBadge("On", "success")
@@ -666,14 +862,14 @@ templ AdminProjectsPage(controls []cloudstore.ProjectSyncControl) {
 								}
 							</td>
 							<td>
-								<form method="post" action={ templ.SafeURL("/dashboard/admin/projects/" + control.Project + "/sync") } class="switch-form">
+								<form method="post" action={ templ.SafeURL("/dashboard/admin/projects/" + url.PathEscape(control.Project) + "/sync") } class="switch-form">
 									<input type="text" name="reason" class="reason-input" placeholder="Reason when pausing" value={ projectControlReasonValue(control) }/>
 									if control.SyncEnabled {
 										<input type="hidden" name="enabled" value="false"/>
-										<button type="submit" class="switch-button is-on">On</button>
+										<button type="submit" class="switch-button is-on" hx-post={ "/dashboard/admin/projects/" + url.PathEscape(control.Project) + "/sync" } hx-include="closest form">On</button>
 									} else {
 										<input type="hidden" name="enabled" value="true"/>
-										<button type="submit" class="switch-button is-off">Off</button>
+										<button type="submit" class="switch-button is-off" hx-post={ "/dashboard/admin/projects/" + url.PathEscape(control.Project) + "/sync" } hx-include="closest form">Off</button>
 									}
 								</form>
 							</td>
@@ -685,8 +881,41 @@ templ AdminProjectsPage(controls []cloudstore.ProjectSyncControl) {
 	</section>
 }
 
-// AdminUsersPage renders the user management view.
-templ AdminUsersPage(users []cloudstore.CloudUser) {
+// AdminUsersListPartial renders only the admin users table + HtmxPaginationBar (no shell, no outer wrapper).
+// R5-2: used by /dashboard/admin/users/list so HTMX pagination works without full-page nav.
+// R6-1: outer <div id="admin-users-content"> removed — avoids duplicate IDs on HTMX innerHTML swap.
+templ AdminUsersListPartial(contributors []cloudstore.DashboardContributorRow, pg Pagination) {
+	if len(contributors) == 0 {
+		@EmptyState("No Contributors Yet", "No contributors have synced chunks to this cloud workspace yet.")
+	} else {
+		<table class="data-table">
+			<thead>
+				<tr>
+					<th>Contributor</th>
+					<th>Chunks</th>
+					<th>Projects</th>
+					<th>Last Chunk</th>
+				</tr>
+			</thead>
+			<tbody>
+				for _, c := range contributors {
+					<tr>
+						<td>{ c.CreatedBy }</td>
+						<td>{ fmt.Sprint(c.Chunks) }</td>
+						<td>{ fmt.Sprint(c.Projects) }</td>
+						<td>{ formatTimestampStr(c.LastChunkAt) }</td>
+					</tr>
+				}
+			</tbody>
+		</table>
+		@HtmxPaginationBar(pg, "/dashboard/admin/users/list", "#admin-users-content", "")
+	}
+}
+
+// AdminUsersPage renders the admin users list shell.
+// R6-1: converted to hx-get/load pattern (mirrors ProjectsPage) — inline table removed.
+// The outer #admin-users-content div triggers an HTMX load of /dashboard/admin/users/list.
+templ AdminUsersPage() {
 	<section class="frame-section">
 		<div class="section-header">
 			<div>
@@ -694,48 +923,20 @@ templ AdminUsersPage(users []cloudstore.CloudUser) {
 				<h2>Admin Users</h2>
 			</div>
 		</div>
-		<div class="admin-nav">
-			<a href="/dashboard/admin">Overview</a>
-			<a href="/dashboard/admin/projects">Projects</a>
-			<a href="/dashboard/admin/users" class="active">Users</a>
-			<a href="/dashboard/admin/health">System Health</a>
+		@adminNav("users")
+		<h3 class="section-block-title">Contributors</h3>
+		<div id="admin-users-content"
+			hx-get="/dashboard/admin/users/list"
+			hx-trigger="load"
+			hx-swap="innerHTML">
+			<p class="muted">Loading...</p>
 		</div>
-		<h3 class="section-block-title">Registered Users</h3>
-		if len(users) == 0 {
-			@EmptyState("No Users Yet", "No users have registered in this cloud workspace yet.")
-		} else {
-			<table class="data-table">
-				<thead>
-					<tr>
-						<th>Username</th>
-						<th>Email</th>
-						<th>API Key</th>
-						<th>Created</th>
-					</tr>
-				</thead>
-				<tbody>
-					for _, u := range users {
-						<tr>
-							<td>{ u.Username }</td>
-							<td>{ u.Email }</td>
-							<td>
-								if u.APIKeyHash != nil {
-									@StatusBadge("Active", "success")
-								} else {
-									@StatusBadge("None", "muted")
-								}
-							</td>
-							<td>{ formatTimestamp(u.CreatedAt) }</td>
-						</tr>
-					}
-				</tbody>
-			</table>
-		}
 	</section>
 }
 
 // AdminHealthPage renders the system health detail view.
-templ AdminHealthPage(health *cloudstore.SystemHealthInfo) {
+// ADAPTED: SystemHealthInfo -> DashboardSystemHealth.
+templ AdminHealthPage(health *cloudstore.DashboardSystemHealth) {
 	<section class="frame-section">
 		<div class="section-header">
 			<div>
@@ -743,12 +944,7 @@ templ AdminHealthPage(health *cloudstore.SystemHealthInfo) {
 				<h2>Admin Health</h2>
 			</div>
 		</div>
-		<div class="admin-nav">
-			<a href="/dashboard/admin">Overview</a>
-			<a href="/dashboard/admin/projects">Projects</a>
-			<a href="/dashboard/admin/users">Users</a>
-			<a href="/dashboard/admin/health" class="active">System Health</a>
-		</div>
+		@adminNav("health")
 		<h3 class="section-block-title">System Health</h3>
 		if health != nil {
 			<table class="data-table">
@@ -764,28 +960,28 @@ templ AdminHealthPage(health *cloudstore.SystemHealthInfo) {
 						</td>
 					</tr>
 					<tr>
-						<th>DB Version</th>
-						<td>{ health.DBVersion }</td>
+						<th>Projects</th>
+						<td>{ fmt.Sprint(health.Projects) }</td>
 					</tr>
 					<tr>
-						<th>Total Users</th>
-						<td>{ fmt.Sprint(health.TotalUsers) }</td>
+						<th>Contributors</th>
+						<td>{ fmt.Sprint(health.Contributors) }</td>
 					</tr>
 					<tr>
-						<th>Total Sessions</th>
-						<td>{ fmt.Sprint(health.TotalSessions) }</td>
+						<th>Sessions</th>
+						<td>{ fmt.Sprint(health.Sessions) }</td>
 					</tr>
 					<tr>
-						<th>Total Memories</th>
-						<td>{ fmt.Sprint(health.TotalMemories) }</td>
+						<th>Observations</th>
+						<td>{ fmt.Sprint(health.Observations) }</td>
 					</tr>
 					<tr>
-						<th>Total Prompts</th>
-						<td>{ fmt.Sprint(health.TotalPrompts) }</td>
+						<th>Prompts</th>
+						<td>{ fmt.Sprint(health.Prompts) }</td>
 					</tr>
 					<tr>
-						<th>Total Mutations</th>
-						<td>{ fmt.Sprint(health.TotalMutations) }</td>
+						<th>Total Chunks</th>
+						<td>{ fmt.Sprint(health.Chunks) }</td>
 					</tr>
 				</tbody>
 			</table>
@@ -802,8 +998,23 @@ templ AdminForbidden() {
 	</section>
 }
 
-// SessionDetailPage renders a connected session detail surface with all related activity.
-templ SessionDetailPage(session *cloudstore.CloudSession, observations []cloudstore.CloudObservation, prompts []cloudstore.CloudPrompt) {
+// AdminSyncToggleFormPartial renders the HTMX-driven toggle form for a single project.
+templ AdminSyncToggleFormPartial(control cloudstore.ProjectSyncControl) {
+	<form method="post" action={ templ.SafeURL("/dashboard/admin/projects/" + url.PathEscape(control.Project) + "/sync") } class="switch-form">
+		<input type="text" name="reason" class="reason-input" placeholder="Reason when pausing" value={ projectControlReasonValue(control) }/>
+		if control.SyncEnabled {
+			<input type="hidden" name="enabled" value="false"/>
+			<button type="submit" class="switch-button is-on" hx-post={ "/dashboard/admin/projects/" + url.PathEscape(control.Project) + "/sync" } hx-include="closest form">On</button>
+		} else {
+			<input type="hidden" name="enabled" value="true"/>
+			<button type="submit" class="switch-button is-off" hx-post={ "/dashboard/admin/projects/" + url.PathEscape(control.Project) + "/sync" } hx-include="closest form">Off</button>
+		}
+	</form>
+}
+
+// SessionDetailPage renders a connected session detail surface.
+// ADAPTED: CloudSession -> DashboardSessionRow; CloudObservation -> DashboardObservationRow; CloudPrompt -> DashboardPromptRow.
+templ SessionDetailPage(session *cloudstore.DashboardSessionRow, observations []cloudstore.DashboardObservationRow, prompts []cloudstore.DashboardPromptRow) {
 	<section class="frame-section">
 		<div class="section-header">
 			<div>
@@ -835,15 +1046,15 @@ templ SessionDetailPage(session *cloudstore.CloudSession, observations []cloudst
 			<div class="data-frame session-meta">
 				<table>
 					<tbody>
-						<tr><th>Session ID</th><td>{ session.ID }</td></tr>
-						<tr><th>Project</th><td><a href={ templ.SafeURL("/dashboard/projects/" + session.Project) }>{ session.Project }</a></td></tr>
+						<tr><th>Session ID</th><td>{ session.SessionID }</td></tr>
+						<tr><th>Project</th><td><a href={ templ.SafeURL("/dashboard/projects/" + url.PathEscape(session.Project)) }>{ session.Project }</a></td></tr>
 						<tr><th>Directory</th><td>{ session.Directory }</td></tr>
 						<tr><th>Started</th><td>{ formatTimestamp(session.StartedAt) }</td></tr>
 						<tr>
 							<th>Ended</th>
 							<td>
-								if session.EndedAt != nil {
-									{ formatTimestampPtr(session.EndedAt) }
+								if session.EndedAt != "" {
+									{ formatTimestamp(session.EndedAt) }
 								} else {
 									@StatusBadge("Active", "success")
 								}
@@ -852,8 +1063,8 @@ templ SessionDetailPage(session *cloudstore.CloudSession, observations []cloudst
 						<tr>
 							<th>Summary</th>
 							<td>
-								if session.Summary != nil {
-									{ *session.Summary }
+								if session.Summary != "" {
+									{ session.Summary }
 								} else {
 									<span class="muted">No session summary captured.</span>
 								}
@@ -863,15 +1074,16 @@ templ SessionDetailPage(session *cloudstore.CloudSession, observations []cloudst
 				</table>
 			</div>
 			<h3 class="section-block-title">Observations in this Session</h3>
-			@ObservationsPartial(observations)
+			@ObservationsPartial(observations, Pagination{})
 			<h3 class="section-block-title">Prompts in this Session</h3>
-			@PromptsPartial(prompts)
+			@PromptsPartial(prompts, Pagination{})
 		}
 	</section>
 }
 
 // ObservationDetailPage renders the full observation payload with session context.
-templ ObservationDetailPage(observation *cloudstore.CloudObservation, session *cloudstore.CloudSession, related []cloudstore.CloudObservation) {
+// ADAPTED: CloudObservation -> DashboardObservationRow; CloudSession -> DashboardSessionRow.
+templ ObservationDetailPage(observation *cloudstore.DashboardObservationRow, session *cloudstore.DashboardSessionRow, related []cloudstore.DashboardObservationRow) {
 	<section class="frame-section">
 		<div class="section-header">
 			<div>
@@ -888,23 +1100,19 @@ templ ObservationDetailPage(observation *cloudstore.CloudObservation, session *c
 		} else {
 			<div class="project-chip-list">
 				@StatusBadge(observation.Type, typeBadgeVariant(observation.Type))
-				if observation.Project != nil {
-					@StatusBadge(*observation.Project, "muted")
-				}
-				@StatusBadge(observation.Scope, "warning")
+				@StatusBadge(observation.Project, "muted")
 			</div>
 			<div class="data-frame observation-detail-body">
 				<table>
 					<tbody>
-						<tr><th>Observation ID</th><td>{ fmt.Sprint(observation.ID) }</td></tr>
-						<tr><th>Session</th><td><a href={ templ.SafeURL("/dashboard/sessions/" + observation.SessionID) }>{ observation.SessionID }</a></td></tr>
+						<tr><th>Chunk ID</th><td>{ observation.ChunkID }</td></tr>
+						<tr><th>Session</th><td><a href={ templ.SafeURL("/dashboard/sessions/" + url.PathEscape(observation.Project) + "/" + url.PathEscape(observation.SessionID)) }>{ observation.SessionID }</a></td></tr>
 						<tr><th>Created</th><td>{ formatTimestamp(observation.CreatedAt) }</td></tr>
-						<tr><th>Updated</th><td>{ formatTimestamp(observation.UpdatedAt) }</td></tr>
 						<tr>
 							<th>Tool</th>
 							<td>
-								if observation.ToolName != nil {
-									{ *observation.ToolName }
+								if observation.ToolName != "" {
+									{ observation.ToolName }
 								} else {
 									<span class="muted">Unknown</span>
 								}
@@ -913,15 +1121,13 @@ templ ObservationDetailPage(observation *cloudstore.CloudObservation, session *c
 						<tr>
 							<th>Topic Key</th>
 							<td>
-								if observation.TopicKey != nil {
-									{ *observation.TopicKey }
+								if observation.TopicKey != "" {
+									{ observation.TopicKey }
 								} else {
 									<span class="muted">None</span>
 								}
 							</td>
 						</tr>
-						<tr><th>Revision Count</th><td>{ fmt.Sprint(observation.RevisionCount) }</td></tr>
-						<tr><th>Duplicate Count</th><td>{ fmt.Sprint(observation.DuplicateCount) }</td></tr>
 					</tbody>
 				</table>
 				<div class="observation-content-block">
@@ -932,17 +1138,97 @@ templ ObservationDetailPage(observation *cloudstore.CloudObservation, session *c
 			if session != nil {
 				<div class="data-frame linked-session-panel">
 					<p class="section-kicker">LINKED SESSION</p>
-					<h3><a href={ templ.SafeURL("/dashboard/sessions/" + session.ID) }>{ session.Project }</a></h3>
+					<h3><a href={ templ.SafeURL("/dashboard/sessions/" + url.PathEscape(session.Project) + "/" + url.PathEscape(session.SessionID)) }>{ session.Project }</a></h3>
 					<p class="muted">Started { formatTimestamp(session.StartedAt) }</p>
-					if session.Summary != nil {
-						<p>{ *session.Summary }</p>
+					if session.Summary != "" {
+						<p>{ session.Summary }</p>
 					}
 				</div>
 			}
 			if len(related) > 0 {
 				<h3 class="section-block-title">More from this Session</h3>
-				@ObservationsPartial(related)
+				@ObservationsPartial(related, Pagination{})
 			}
 		}
 	</section>
+}
+
+// ─── Phase 9: Audit Log Admin Views ─────────────────────────────────────────
+
+// AdminAuditLogPage renders the admin audit log shell page.
+// The HTMX container triggers loading the list partial on page load. REQ-408.
+// JW2: buildAuditListURL embeds active filter params into the initial hx-get URL
+// so that deep-linking /dashboard/admin/audit-log?contributor=alice preserves filters.
+templ AdminAuditLogPage(displayName string, filter cloudstore.AuditFilter) {
+	<section class="frame-section">
+		<div class="section-header">
+			<div>
+				<p class="section-kicker">ADMIN SURFACE</p>
+				<h2>Audit Log</h2>
+			</div>
+		</div>
+		@adminNav("audit-log")
+		<div id="audit-log-content"
+			hx-get={ buildAuditListURL(filter) }
+			hx-trigger="load"
+			hx-swap="innerHTML">
+			<p class="muted">Loading audit log...</p>
+		</div>
+	</section>
+}
+
+// AdminAuditLogListPartial renders the audit log table with filters and pagination. REQ-409, REQ-410.
+templ AdminAuditLogListPartial(entries []cloudstore.DashboardAuditRow, pg Pagination, filter cloudstore.AuditFilter) {
+	<div>
+		<form class="browser-controls" method="get" action="/dashboard/admin/audit-log/list"
+			hx-get="/dashboard/admin/audit-log/list"
+			hx-target="#audit-log-content"
+			hx-swap="innerHTML"
+			hx-trigger="submit">
+			<input id="audit-contributor" type="text" name="contributor" placeholder="Contributor" value={ filter.Contributor }/>
+			<input id="audit-project" type="text" name="project" placeholder="Project" value={ filter.Project }/>
+			<select id="audit-outcome" name="outcome">
+				<option value="">All Outcomes</option>
+				if filter.Outcome == cloudstore.AuditOutcomeRejectedProjectPaused {
+					<option value={ cloudstore.AuditOutcomeRejectedProjectPaused } selected>Rejected (Paused)</option>
+				} else {
+					<option value={ cloudstore.AuditOutcomeRejectedProjectPaused }>Rejected (Paused)</option>
+				}
+			</select>
+			<input id="audit-from" type="text" name="from" placeholder="From (RFC3339)" value={ auditTimeValue(filter.OccurredAtFrom) }/>
+			<input id="audit-to" type="text" name="to" placeholder="To (RFC3339)" value={ auditTimeValue(filter.OccurredAtTo) }/>
+			<button type="submit">Filter</button>
+		</form>
+		if len(entries) == 0 {
+			@EmptyState("No Audit Entries", "No audit log entries match the current filter.")
+		} else {
+			<table class="data-table">
+				<thead>
+					<tr>
+						<th>Time</th>
+						<th>Contributor</th>
+						<th>Project</th>
+						<th>Action</th>
+						<th>Outcome</th>
+						<th>Entries</th>
+						<th>Reason</th>
+					</tr>
+				</thead>
+				<tbody>
+					for _, entry := range entries {
+						<tr>
+							<td>{ formatTimestampStr(entry.OccurredAt) }</td>
+							<td>{ entry.Contributor }</td>
+							<td>{ entry.Project }</td>
+							<td>{ entry.Action }</td>
+							<td>{ entry.Outcome }</td>
+							<td>{ fmt.Sprint(entry.EntryCount) }</td>
+							<td>{ entry.ReasonCode }</td>
+						</tr>
+					}
+				</tbody>
+			</table>
+			@HtmxPaginationBar(pg, "/dashboard/admin/audit-log/list", "#audit-log-content", "#audit-contributor, #audit-project, #audit-outcome, #audit-from, #audit-to")
+		}
+	</div>
 }

@@ -1,24 +1,22 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
 	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/Gentleman-Programming/engram/internal/cloud"
-	"github.com/Gentleman-Programming/engram/internal/cloud/auth"
-	"github.com/Gentleman-Programming/engram/internal/cloud/cloudserver"
-	"github.com/Gentleman-Programming/engram/internal/cloud/cloudstore"
-	"github.com/Gentleman-Programming/engram/internal/cloud/remote"
+	"github.com/Gentleman-Programming/engram/internal/mcp"
+	"github.com/Gentleman-Programming/engram/internal/obsidian"
+	"github.com/Gentleman-Programming/engram/internal/setup"
 	"github.com/Gentleman-Programming/engram/internal/store"
+	engramsync "github.com/Gentleman-Programming/engram/internal/sync"
+	versioncheck "github.com/Gentleman-Programming/engram/internal/version"
+	mcpserver "github.com/mark3labs/mcp-go/server"
 )
 
 func testConfig(t *testing.T) store.Config {
@@ -52,6 +50,13 @@ func withCwd(t *testing.T, dir string) {
 	t.Cleanup(func() {
 		_ = os.Chdir(old)
 	})
+}
+
+func stubCheckForUpdates(t *testing.T, result versioncheck.CheckResult) {
+	t.Helper()
+	old := checkForUpdates
+	checkForUpdates = func(string) versioncheck.CheckResult { return result }
+	t.Cleanup(func() { checkForUpdates = old })
 }
 
 func captureOutput(t *testing.T, fn func()) (stdout string, stderr string) {
@@ -161,28 +166,78 @@ func TestPrintUsage(t *testing.T) {
 	if !strings.Contains(stdout, "search <query>") || !strings.Contains(stdout, "setup [agent]") {
 		t.Fatalf("usage missing expected commands: %q", stdout)
 	}
+	if !strings.Contains(stdout, "cloud <subcommand>") {
+		t.Fatalf("usage missing cloud command tree: %q", stdout)
+	}
+	if !strings.Contains(stdout, "serve      Run cloud backend + dashboard") {
+		t.Fatalf("usage missing cloud serve command: %q", stdout)
+	}
+	if !strings.Contains(stdout, "Required for cloud serve in BOTH token auth and insecure no-auth mode") {
+		t.Fatalf("usage missing updated ENGRAM_CLOUD_ALLOWED_PROJECTS contract: %q", stdout)
+	}
+	for _, token := range []string{
+		"ENGRAM_DATABASE_URL",
+		"ENGRAM_CLOUD_HOST",
+		"ENGRAM_CLOUD_TOKEN",
+		"ENGRAM_CLOUD_INSECURE_NO_AUTH",
+		"Cannot be combined with ENGRAM_CLOUD_TOKEN",
+		"Cannot be combined with ENGRAM_CLOUD_ADMIN",
+		"ENGRAM_CLOUD_ADMIN",
+	} {
+		if !strings.Contains(stdout, token) {
+			t.Fatalf("usage missing cloud serve env/runtime rule %q: %q", token, stdout)
+		}
+	}
 }
 
 func TestPrintPostInstall(t *testing.T) {
 	tests := []struct {
-		agent   string
-		expects []string
+		name       string
+		result     *setup.Result
+		expects    []string
+		notExpects []string
 	}{
-		{agent: "opencode", expects: []string{"Restart OpenCode", "engram serve &"}},
-		{agent: "gemini-cli", expects: []string{"Restart Gemini CLI", "~/.gemini/settings.json"}},
-		{agent: "codex", expects: []string{"Restart Codex", "~/.codex/config.toml"}},
-		{agent: "unknown", expects: nil},
+		{
+			name:    "opencode with subagent monitor enabled",
+			result:  &setup.Result{Agent: "opencode", TUIPluginEnabled: true},
+			expects: []string{"Restart OpenCode", "opencode-subagent-statusline", "engram serve &"},
+		},
+		{
+			name:       "opencode with subagent monitor not enabled",
+			result:     &setup.Result{Agent: "opencode", TUIPluginEnabled: false},
+			expects:    []string{"Restart OpenCode", "engram serve &"},
+			notExpects: []string{"opencode-subagent-statusline"},
+		},
+		{
+			name:    "gemini-cli",
+			result:  &setup.Result{Agent: "gemini-cli"},
+			expects: []string{"Restart Gemini CLI", "~/.gemini/settings.json"},
+		},
+		{
+			name:    "codex",
+			result:  &setup.Result{Agent: "codex"},
+			expects: []string{"Restart Codex", "~/.codex/config.toml"},
+		},
+		{
+			name:   "unknown",
+			result: &setup.Result{Agent: "unknown"},
+		},
 	}
 
 	for _, tc := range tests {
-		t.Run(tc.agent, func(t *testing.T) {
-			stdout, stderr := captureOutput(t, func() { printPostInstall(tc.agent) })
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, stderr := captureOutput(t, func() { printPostInstall(tc.result) })
 			if stderr != "" {
 				t.Fatalf("expected no stderr, got: %q", stderr)
 			}
 			for _, expected := range tc.expects {
 				if !strings.Contains(stdout, expected) {
 					t.Fatalf("output missing %q: %q", expected, stdout)
+				}
+			}
+			for _, forbidden := range tc.notExpects {
+				if strings.Contains(stdout, forbidden) {
+					t.Fatalf("output unexpectedly contains %q: %q", forbidden, stdout)
 				}
 			}
 			if len(tc.expects) == 0 && stdout != "" {
@@ -212,7 +267,7 @@ func TestPrintPostInstallClaudeCodeAllowlist(t *testing.T) {
 			return nil
 		}
 
-		stdout, _ := captureOutput(t, func() { printPostInstall("claude-code") })
+		stdout, _ := captureOutput(t, func() { printPostInstall(&setup.Result{Agent: "claude-code"}) })
 		if !allowlistCalled {
 			t.Fatalf("expected AddClaudeCodeAllowlist to be called")
 		}
@@ -243,7 +298,7 @@ func TestPrintPostInstallClaudeCodeAllowlist(t *testing.T) {
 			return nil
 		}
 
-		stdout, _ := captureOutput(t, func() { printPostInstall("claude-code") })
+		stdout, _ := captureOutput(t, func() { printPostInstall(&setup.Result{Agent: "claude-code"}) })
 		if allowlistCalled {
 			t.Fatalf("expected AddClaudeCodeAllowlist NOT to be called")
 		}
@@ -269,11 +324,78 @@ func TestPrintPostInstallClaudeCodeAllowlist(t *testing.T) {
 			return os.ErrPermission
 		}
 
-		_, stderr := captureOutput(t, func() { printPostInstall("claude-code") })
+		_, stderr := captureOutput(t, func() { printPostInstall(&setup.Result{Agent: "claude-code"}) })
 		if !strings.Contains(stderr, "warning") {
 			t.Fatalf("expected warning in stderr, got: %q", stderr)
 		}
 	})
+}
+
+func TestCmdSyncCloudRegressionPreservesLegacyBehaviorWithUpgradeStatePresent(t *testing.T) {
+	stubExitWithPanic(t)
+	stubRuntimeHooks(t)
+
+	originalSyncExport := syncExport
+	originalSyncStatus := syncStatus
+	t.Cleanup(func() {
+		syncExport = originalSyncExport
+		syncStatus = originalSyncStatus
+	})
+
+	cfg := testConfig(t)
+	t.Setenv("ENGRAM_CLOUD_SERVER", "https://cloud.example.test")
+	t.Setenv("ENGRAM_CLOUD_TOKEN", "token-abc")
+
+	s, err := store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	if err := s.EnrollProject("proj-a"); err != nil {
+		_ = s.Close()
+		t.Fatalf("enroll project: %v", err)
+	}
+	if err := s.SaveCloudUpgradeState(store.CloudUpgradeState{
+		Project:          "proj-a",
+		Stage:            store.UpgradeStageDoctorBlocked,
+		RepairClass:      store.UpgradeRepairClassRepairable,
+		LastErrorCode:    "upgrade_repairable_unenrolled",
+		LastErrorMessage: "legacy metadata drift",
+	}); err != nil {
+		_ = s.Close()
+		t.Fatalf("seed upgrade state: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	syncExport = func(*engramsync.Syncer, string, string) (*engramsync.SyncResult, error) {
+		return &engramsync.SyncResult{ChunkID: "chunk-regression", SessionsExported: 1}, nil
+	}
+	syncStatus = func(*engramsync.Syncer) (int, int, int, error) {
+		return 1, 1, 0, nil
+	}
+
+	withArgs(t, "engram", "sync", "--cloud", "--project", "proj-a")
+	stdout, stderr, recovered := captureOutputAndRecover(t, func() { cmdSync(cfg) })
+	if recovered != nil || stderr != "" {
+		t.Fatalf("cloud sync regression path should stay successful, panic=%v stderr=%q", recovered, stderr)
+	}
+	if !strings.Contains(stdout, "Cloud sync complete for project \"proj-a\".") {
+		t.Fatalf("expected unchanged cloud sync success messaging, got %q", stdout)
+	}
+
+	s, err = store.New(cfg)
+	if err != nil {
+		t.Fatalf("store.New (verify): %v", err)
+	}
+	defer s.Close()
+	state, err := s.GetCloudUpgradeState("proj-a")
+	if err != nil {
+		t.Fatalf("load upgrade state: %v", err)
+	}
+	if state == nil || state.Stage != store.UpgradeStageDoctorBlocked {
+		t.Fatalf("sync --cloud must not mutate upgrade stage; got %+v", state)
+	}
 }
 
 func TestCmdSaveAndSearch(t *testing.T) {
@@ -458,7 +580,7 @@ func TestCmdSyncStatusExportAndImport(t *testing.T) {
 	if noopErr != "" {
 		t.Fatalf("expected no stderr from second sync import, got: %q", noopErr)
 	}
-	if !strings.Contains(noopOut, "Already up to date") {
+	if !strings.Contains(noopOut, "No new chunks to import") {
 		t.Fatalf("unexpected second sync import output: %q", noopOut)
 	}
 }
@@ -484,58 +606,11 @@ func TestCmdSyncDefaultProjectNoData(t *testing.T) {
 	}
 }
 
-func TestCmdSyncRemoteNoOp(t *testing.T) {
-	var manifestCalls int
-	var chunkCalls int
-	var pushCalls int
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer sync-token" {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/sync/pull":
-			manifestCalls++
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]any{"version": 1, "chunks": []any{}})
-		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/sync/pull/"):
-			chunkCalls++
-			w.WriteHeader(http.StatusNotFound)
-		case r.Method == http.MethodPost && r.URL.Path == "/sync/push":
-			pushCalls++
-			w.WriteHeader(http.StatusOK)
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer srv.Close()
-
-	oldClient := cloudHTTPClient
-	t.Cleanup(func() { cloudHTTPClient = oldClient })
-	cloudHTTPClient = func() *http.Client { return srv.Client() }
-
-	withArgs(t, "engram", "sync", "--remote", srv.URL, "--token", "sync-token")
-	stdout, stderr := captureOutput(t, func() { cmdSync(testConfig(t)) })
-	if stderr != "" {
-		t.Fatalf("expected no stderr, got %q", stderr)
-	}
-	if !strings.Contains(stdout, "Nothing new to push") || !strings.Contains(stdout, "Nothing new to pull") {
-		t.Fatalf("unexpected output: %q", stdout)
-	}
-	if manifestCalls == 0 {
-		t.Fatal("expected manifest requests")
-	}
-	if pushCalls != 0 || chunkCalls != 0 {
-		t.Fatalf("expected no push or chunk requests, got push=%d chunk=%d", pushCalls, chunkCalls)
-	}
-}
-
 func TestMainVersionAndHelpAliases(t *testing.T) {
 	oldVersion := version
 	version = "9.9.9-test"
 	t.Cleanup(func() { version = oldVersion })
+	stubCheckForUpdates(t, versioncheck.CheckResult{Status: versioncheck.StatusUpToDate})
 
 	tests := []struct {
 		name      string
@@ -565,6 +640,57 @@ func TestMainVersionAndHelpAliases(t *testing.T) {
 	}
 }
 
+func TestMainPrintsUpdateFailuresAndUpdates(t *testing.T) {
+	oldVersion := version
+	version = "1.10.7"
+	t.Cleanup(func() { version = oldVersion })
+
+	t.Run("prints check failure", func(t *testing.T) {
+		stubCheckForUpdates(t, versioncheck.CheckResult{
+			Status:  versioncheck.StatusCheckFailed,
+			Message: "Could not check for updates: GitHub took too long to respond.",
+		})
+		withArgs(t, "engram", "version")
+
+		stdout, stderr := captureOutput(t, func() { main() })
+		if !strings.Contains(stdout, "engram 1.10.7") {
+			t.Fatalf("stdout = %q", stdout)
+		}
+		if !strings.Contains(stderr, "Could not check for updates") {
+			t.Fatalf("stderr = %q", stderr)
+		}
+	})
+
+	t.Run("prints available update", func(t *testing.T) {
+		stubCheckForUpdates(t, versioncheck.CheckResult{
+			Status:  versioncheck.StatusUpdateAvailable,
+			Message: "Update available: 1.10.7 -> 1.10.8",
+		})
+		withArgs(t, "engram", "version")
+
+		stdout, stderr := captureOutput(t, func() { main() })
+		if !strings.Contains(stdout, "engram 1.10.7") {
+			t.Fatalf("stdout = %q", stdout)
+		}
+		if !strings.Contains(stderr, "Update available") {
+			t.Fatalf("stderr = %q", stderr)
+		}
+	})
+
+	t.Run("prints nothing when up to date", func(t *testing.T) {
+		stubCheckForUpdates(t, versioncheck.CheckResult{Status: versioncheck.StatusUpToDate})
+		withArgs(t, "engram", "version")
+
+		stdout, stderr := captureOutput(t, func() { main() })
+		if !strings.Contains(stdout, "engram 1.10.7") {
+			t.Fatalf("stdout = %q", stdout)
+		}
+		if stderr != "" {
+			t.Fatalf("stderr = %q, want empty", stderr)
+		}
+	})
+}
+
 func TestMainExitPaths(t *testing.T) {
 	tests := []struct {
 		name            string
@@ -575,6 +701,9 @@ func TestMainExitPaths(t *testing.T) {
 	}{
 		{name: "no args", helperCase: "no-args", expectedOutput: "Usage:", expectedExitOne: true},
 		{name: "unknown command", helperCase: "unknown", expectedOutput: "Usage:", expectedStderr: "unknown command:", expectedExitOne: true},
+		{name: "cloud missing subcommand", helperCase: "cloud-missing", expectedOutput: "usage: engram cloud", expectedExitOne: true},
+		{name: "cloud unknown subcommand", helperCase: "cloud-unknown", expectedOutput: "supported subcommands", expectedStderr: "unknown cloud command", expectedExitOne: true},
+		{name: "cloud enroll missing project", helperCase: "cloud-enroll-missing", expectedOutput: "usage: engram cloud enroll <project>", expectedExitOne: true},
 	}
 
 	for _, tc := range tests {
@@ -616,6 +745,12 @@ func TestMainExitHelper(t *testing.T) {
 		os.Args = []string{"engram"}
 	case "unknown":
 		os.Args = []string{"engram", "definitely-unknown-command"}
+	case "cloud-missing":
+		os.Args = []string{"engram", "cloud"}
+	case "cloud-unknown":
+		os.Args = []string{"engram", "cloud", "nope"}
+	case "cloud-enroll-missing":
+		os.Args = []string{"engram", "cloud", "enroll"}
 	default:
 		os.Args = []string{"engram", "--help"}
 	}
@@ -623,278 +758,7 @@ func TestMainExitHelper(t *testing.T) {
 	main()
 }
 
-// ─── Cloud CLI Tests ─────────────────────────────────────────────────────────
-
-func TestCmdCloudServeMissingDatabaseURL(t *testing.T) {
-	// Ensure ENGRAM_DATABASE_URL is not set
-	t.Setenv("ENGRAM_DATABASE_URL", "")
-	t.Setenv("ENGRAM_JWT_SECRET", "")
-
-	exitCalled := false
-	exitCode := 0
-	oldExit := exitFunc
-	t.Cleanup(func() { exitFunc = oldExit })
-	exitFunc = func(code int) {
-		exitCalled = true
-		exitCode = code
-	}
-
-	withArgs(t, "engram", "cloud", "serve")
-	_, stderr := captureOutput(t, func() { cmdCloudServe() })
-
-	if !exitCalled || exitCode != 1 {
-		t.Fatalf("expected exit(1), got exitCalled=%v code=%d", exitCalled, exitCode)
-	}
-	if !strings.Contains(stderr, "ENGRAM_DATABASE_URL") {
-		t.Fatalf("expected DATABASE_URL error in stderr, got: %q", stderr)
-	}
-}
-
-func TestCmdCloudServeMissingJWTSecret(t *testing.T) {
-	t.Setenv("ENGRAM_DATABASE_URL", "postgres://fake:fake@localhost:5432/fake")
-	t.Setenv("ENGRAM_JWT_SECRET", "")
-
-	exitCalled := false
-	exitCode := 0
-	oldExit := exitFunc
-	t.Cleanup(func() { exitFunc = oldExit })
-	exitFunc = func(code int) {
-		exitCalled = true
-		exitCode = code
-	}
-
-	withArgs(t, "engram", "cloud", "serve")
-	_, stderr := captureOutput(t, func() { cmdCloudServe() })
-
-	if !exitCalled || exitCode != 1 {
-		t.Fatalf("expected exit(1), got exitCalled=%v code=%d", exitCalled, exitCode)
-	}
-	if !strings.Contains(stderr, "ENGRAM_JWT_SECRET") {
-		t.Fatalf("expected JWT_SECRET error in stderr, got: %q", stderr)
-	}
-}
-
-func TestCmdCloudServeWithFlags(t *testing.T) {
-	// Test that --database-url flag overrides env var
-	t.Setenv("ENGRAM_DATABASE_URL", "postgres://env@localhost/env")
-	t.Setenv("ENGRAM_JWT_SECRET", "this-is-a-secret-at-least-32-chars-long!!!")
-
-	oldExit := exitFunc
-	t.Cleanup(func() { exitFunc = oldExit })
-	exitFunc = func(code int) {}
-
-	// Test that providing --database-url doesn't trigger the "missing" error
-	withArgs(t, "engram", "cloud", "serve", "--database-url", "postgres://flag@localhost/flag")
-	_, stderr := captureOutput(t, func() { cmdCloudServe() })
-
-	// It should NOT complain about missing DATABASE_URL — it should fail later
-	// (at cloudstore.New or auth.NewService with invalid DSN)
-	if strings.Contains(stderr, "ENGRAM_DATABASE_URL is required") {
-		t.Fatalf("--database-url flag should override env requirement, got: %q", stderr)
-	}
-}
-
-func TestCmdCloudServeHappyPath(t *testing.T) {
-	oldStoreNew := cloudStoreNew
-	oldStoreClose := cloudStoreClose
-	oldAuthNew := cloudAuthNew
-	oldServerNew := cloudServerNew
-	oldServerStart := cloudServerStart
-	t.Cleanup(func() {
-		cloudStoreNew = oldStoreNew
-		cloudStoreClose = oldStoreClose
-		cloudAuthNew = oldAuthNew
-		cloudServerNew = oldServerNew
-		cloudServerStart = oldServerStart
-	})
-
-	secret := strings.Repeat("s", 32)
-	t.Setenv("ENGRAM_JWT_SECRET", secret)
-
-	var gotCfg cloud.Config
-	var gotSecret string
-	var gotPort int
-
-	cloudStoreNew = func(cfg cloud.Config) (*cloudstore.CloudStore, error) {
-		gotCfg = cfg
-		return &cloudstore.CloudStore{}, nil
-	}
-	cloudStoreClose = func(*cloudstore.CloudStore) error { return nil }
-	cloudAuthNew = func(cs *cloudstore.CloudStore, jwtSecret string) (*auth.Service, error) {
-		gotSecret = jwtSecret
-		return &auth.Service{}, nil
-	}
-	cloudServerNew = func(cs *cloudstore.CloudStore, svc *auth.Service, port int, opts ...cloudserver.Option) *cloudserver.CloudServer {
-		gotPort = port
-		return &cloudserver.CloudServer{}
-	}
-	cloudServerStart = func(*cloudserver.CloudServer) error { return nil }
-
-	withArgs(t, "engram", "cloud", "serve", "--port", "9090", "--database-url", "postgres://flag@localhost/cloud")
-	stdout, stderr := captureOutput(t, func() { cmdCloudServe() })
-	if stdout != "" || stderr != "" {
-		t.Fatalf("expected no output, got stdout=%q stderr=%q", stdout, stderr)
-	}
-	if gotCfg.DSN != "postgres://flag@localhost/cloud" {
-		t.Fatalf("database url = %q", gotCfg.DSN)
-	}
-	if gotSecret != secret {
-		t.Fatalf("secret = %q", gotSecret)
-	}
-	if gotPort != 9090 {
-		t.Fatalf("port = %d", gotPort)
-	}
-}
-
-func TestCloudConfigLoadSave(t *testing.T) {
-	tmpHome := t.TempDir()
-	oldHomeDir := userHomeDir
-	t.Cleanup(func() { userHomeDir = oldHomeDir })
-	userHomeDir = func() (string, error) { return tmpHome, nil }
-
-	// Test save
-	cc := &CloudConfig{
-		ServerURL:    "https://engram.example.com",
-		Token:        "eng_test123",
-		RefreshToken: "refresh-123",
-		UserID:       "u-123",
-		Username:     "alice",
-	}
-	dataDir := filepath.Join(tmpHome, ".engram")
-	if err := saveCloudConfig(dataDir, cc); err != nil {
-		t.Fatalf("saveCloudConfig: %v", err)
-	}
-
-	// Verify file permissions
-	path := filepath.Join(dataDir, "cloud.json")
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat config file: %v", err)
-	}
-	perm := info.Mode().Perm()
-	if perm != 0600 {
-		t.Fatalf("expected 0600 permissions, got %04o", perm)
-	}
-
-	// Test load
-	loaded, err := loadCloudConfig(dataDir)
-	if err != nil {
-		t.Fatalf("loadCloudConfig: %v", err)
-	}
-	if loaded.ServerURL != cc.ServerURL || loaded.Token != cc.Token || loaded.RefreshToken != cc.RefreshToken ||
-		loaded.UserID != cc.UserID || loaded.Username != cc.Username {
-		t.Fatalf("loaded config doesn't match saved: got %+v, want %+v", loaded, cc)
-	}
-
-	// Test load with missing file
-	emptyDir := filepath.Join(t.TempDir(), ".engram")
-	_, err = loadCloudConfig(emptyDir)
-	if err == nil {
-		t.Fatalf("expected error loading from nonexistent path")
-	}
-}
-
-func TestCmdCloudDispatchUnknown(t *testing.T) {
-	exitCalled := false
-	oldExit := exitFunc
-	t.Cleanup(func() { exitFunc = oldExit })
-	exitFunc = func(code int) { exitCalled = true }
-
-	cfg := testConfig(t)
-	withArgs(t, "engram", "cloud", "nonexistent")
-	_, stderr := captureOutput(t, func() { cmdCloud(cfg) })
-
-	if !exitCalled {
-		t.Fatalf("expected exit for unknown cloud subcommand")
-	}
-	if !strings.Contains(stderr, "unknown cloud command") {
-		t.Fatalf("expected unknown command error, got: %q", stderr)
-	}
-}
-
-func TestCmdCloudDispatchNoSubcommand(t *testing.T) {
-	exitCalled := false
-	oldExit := exitFunc
-	t.Cleanup(func() { exitFunc = oldExit })
-	exitFunc = func(code int) { exitCalled = true }
-
-	cfg := testConfig(t)
-	withArgs(t, "engram", "cloud")
-	_, stderr := captureOutput(t, func() { cmdCloud(cfg) })
-
-	if !exitCalled {
-		t.Fatalf("expected exit for missing cloud subcommand")
-	}
-	if !strings.Contains(stderr, "usage: engram cloud") {
-		t.Fatalf("expected usage in stderr, got: %q", stderr)
-	}
-}
-
-func TestCmdSearchRemoteFlag(t *testing.T) {
-	// Set up a mock cloud server that returns search results
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/sync/search" {
-			t.Errorf("unexpected path: %s", r.URL.Path)
-			w.WriteHeader(404)
-			return
-		}
-		if r.Header.Get("Authorization") != "Bearer test-token-123" {
-			t.Errorf("missing or wrong auth header: %s", r.Header.Get("Authorization"))
-			w.WriteHeader(401)
-			json.NewEncoder(w).Encode(map[string]string{"error": "unauthorized"})
-			return
-		}
-		q := r.URL.Query().Get("q")
-		if q == "" {
-			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]string{"error": "q required"})
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(200)
-		json.NewEncoder(w).Encode(map[string]any{
-			"results": []map[string]any{
-				{
-					"id":         42,
-					"type":       "decision",
-					"title":      "Use JWT auth",
-					"content":    "We decided to use JWT for authentication",
-					"project":    "engram",
-					"scope":      "project",
-					"rank":       0.95,
-					"created_at": "2026-03-07T10:00:00Z",
-				},
-			},
-		})
-	}))
-	defer srv.Close()
-
-	// Override the HTTP client to use the test server
-	oldClient := cloudHTTPClient
-	t.Cleanup(func() { cloudHTTPClient = oldClient })
-	cloudHTTPClient = func() *http.Client { return srv.Client() }
-
-	cfg := testConfig(t)
-
-	withArgs(t, "engram", "search", "authentication", "--remote", srv.URL, "--token", "test-token-123")
-	stdout, stderr := captureOutput(t, func() { cmdSearch(cfg) })
-	if stderr != "" {
-		t.Fatalf("expected no stderr, got: %q", stderr)
-	}
-	if !strings.Contains(stdout, "Found 1 memories (cloud)") {
-		t.Fatalf("expected cloud search results, got: %q", stdout)
-	}
-	if !strings.Contains(stdout, "Use JWT auth") {
-		t.Fatalf("expected search result title, got: %q", stdout)
-	}
-}
-
-func TestCmdSearchDefaultLocalMode(t *testing.T) {
-	// Ensure no remote env vars are set
-	t.Setenv("ENGRAM_REMOTE_URL", "")
-	t.Setenv("ENGRAM_TOKEN", "")
-
+func TestCmdSearchLocalMode(t *testing.T) {
 	cfg := testConfig(t)
 	mustSeedObservation(t, cfg, "s-local", "proj-local", "note", "local-result", "local content for search", "project")
 
@@ -904,924 +768,681 @@ func TestCmdSearchDefaultLocalMode(t *testing.T) {
 		t.Fatalf("expected no stderr, got: %q", stderr)
 	}
 	if !strings.Contains(stdout, "Found") && !strings.Contains(stdout, "local-result") {
-		// If FTS doesn't find it (timing), at least verify we didn't hit a remote server
-		if strings.Contains(stdout, "cloud") {
-			t.Fatalf("default mode should be local, not cloud: %q", stdout)
-		}
+		t.Fatalf("expected local search results, got: %q", stdout)
 	}
 }
 
-func TestCmdContextRemoteFlag(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/sync/context" {
-			w.WriteHeader(404)
-			return
-		}
-		if r.Header.Get("Authorization") != "Bearer ctx-token" {
-			w.WriteHeader(401)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{
-			"context": "## Memory from Cloud\n\nRemote context data here.",
-		})
-	}))
-	defer srv.Close()
+// ─── Projects command tests ───────────────────────────────────────────────────
 
-	oldClient := cloudHTTPClient
-	t.Cleanup(func() { cloudHTTPClient = oldClient })
-	cloudHTTPClient = func() *http.Client { return srv.Client() }
-
+func TestCmdProjectsListEmpty(t *testing.T) {
 	cfg := testConfig(t)
-	withArgs(t, "engram", "context", "--remote", srv.URL, "--token", "ctx-token")
-	stdout, stderr := captureOutput(t, func() { cmdContext(cfg) })
+
+	withArgs(t, "engram", "projects", "list")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsList(cfg) })
 	if stderr != "" {
 		t.Fatalf("expected no stderr, got: %q", stderr)
 	}
-	if !strings.Contains(stdout, "Remote context data here") {
-		t.Fatalf("expected remote context output, got: %q", stdout)
+	if !strings.Contains(stdout, "No projects found") {
+		t.Fatalf("expected empty projects message, got: %q", stdout)
 	}
 }
 
-func TestPrintUsageIncludesCloudCommands(t *testing.T) {
-	oldVersion := version
-	version = "test-version"
-	t.Cleanup(func() { version = oldVersion })
+func TestCmdProjectsList(t *testing.T) {
+	cfg := testConfig(t)
 
-	stdout, _ := captureOutput(t, func() { printUsage() })
+	// Seed observations for two projects
+	mustSeedObservation(t, cfg, "s-alpha", "alpha", "note", "alpha-note", "alpha content", "project")
+	mustSeedObservation(t, cfg, "s-alpha", "alpha", "bugfix", "alpha-bug", "alpha bug", "project")
+	mustSeedObservation(t, cfg, "s-beta", "beta", "decision", "beta-note", "beta content", "project")
 
-	cloudItems := []string{
-		"cloud serve",
-		"cloud register",
-		"cloud login",
-		"cloud sync",
-		"cloud status",
-		"cloud api-key",
-		"--remote",
-		"--token",
-		"ENGRAM_REMOTE_URL",
-		"ENGRAM_TOKEN",
-		"ENGRAM_DATABASE_URL",
-		"ENGRAM_JWT_SECRET",
-	}
-	for _, item := range cloudItems {
-		if !strings.Contains(stdout, item) {
-			t.Errorf("usage output missing %q", item)
-		}
-	}
-}
-
-func TestCmdCloudRegisterServerRequired(t *testing.T) {
-	exitCalled := false
-	oldExit := exitFunc
-	t.Cleanup(func() { exitFunc = oldExit })
-	exitFunc = func(code int) { exitCalled = true }
-
-	withArgs(t, "engram", "cloud", "register")
-	_, stderr := captureOutput(t, func() { cmdCloudRegister(t.TempDir()) })
-
-	if !exitCalled {
-		t.Fatalf("expected exit for missing --server")
-	}
-	if !strings.Contains(stderr, "--server is required") {
-		t.Fatalf("expected --server error, got: %q", stderr)
-	}
-}
-
-func TestCmdCloudLoginServerRequired(t *testing.T) {
-	exitCalled := false
-	oldExit := exitFunc
-	t.Cleanup(func() { exitFunc = oldExit })
-	exitFunc = func(code int) { exitCalled = true }
-
-	withArgs(t, "engram", "cloud", "login")
-	_, stderr := captureOutput(t, func() { cmdCloudLogin(t.TempDir()) })
-
-	if !exitCalled {
-		t.Fatalf("expected exit for missing --server")
-	}
-	if !strings.Contains(stderr, "--server is required") {
-		t.Fatalf("expected --server error, got: %q", stderr)
-	}
-}
-
-func TestCmdCloudRegisterIntegration(t *testing.T) {
-	// Mock cloud server
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" || r.URL.Path != "/auth/register" {
-			w.WriteHeader(404)
-			return
-		}
-		var body struct {
-			Username string `json:"username"`
-			Email    string `json:"email"`
-			Password string `json:"password"`
-		}
-		json.NewDecoder(r.Body).Decode(&body)
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(201)
-		json.NewEncoder(w).Encode(auth.AuthResult{
-			UserID:       "u-new",
-			Username:     body.Username,
-			AccessToken:  "access-tok",
-			RefreshToken: "refresh-tok",
-			ExpiresIn:    3600,
-		})
-	}))
-	defer srv.Close()
-
-	// Override stdin scanner
-	oldScanner := stdinScanner
-	t.Cleanup(func() { stdinScanner = oldScanner })
-	stdinScanner = func() *bufio.Scanner {
-		return bufio.NewScanner(strings.NewReader("alice\nalice@test.com\nsecret1234\n"))
-	}
-
-	// Override HTTP client
-	oldClient := cloudHTTPClient
-	t.Cleanup(func() { cloudHTTPClient = oldClient })
-	cloudHTTPClient = func() *http.Client { return srv.Client() }
-
-	// Override home dir for config save
-	tmpHome := t.TempDir()
-	dataDir := filepath.Join(tmpHome, ".engram")
-
-	withArgs(t, "engram", "cloud", "register", "--server", srv.URL)
-	stdout, stderr := captureOutput(t, func() { cmdCloudRegister(dataDir) })
+	withArgs(t, "engram", "projects", "list")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsList(cfg) })
 	if stderr != "" {
 		t.Fatalf("expected no stderr, got: %q", stderr)
 	}
-	if !strings.Contains(stdout, "Registered as alice") {
-		t.Fatalf("expected registration success, got: %q", stdout)
+	if !strings.Contains(stdout, "Projects (2)") {
+		t.Fatalf("expected 'Projects (2)', got: %q", stdout)
 	}
-
-	// Verify config was saved
-	cc, err := loadCloudConfig(dataDir)
-	if err != nil {
-		t.Fatalf("loadCloudConfig after register: %v", err)
+	if !strings.Contains(stdout, "alpha") || !strings.Contains(stdout, "beta") {
+		t.Fatalf("expected project names in output, got: %q", stdout)
 	}
-	if cc.ServerURL != srv.URL || cc.Token != "access-tok" || cc.RefreshToken != "refresh-tok" || cc.UserID != "u-new" || cc.Username != "alice" {
-		t.Fatalf("unexpected saved config: %+v", cc)
+	// alpha has 2 observations, beta has 1 — alpha should appear first
+	alphaIdx := strings.Index(stdout, "alpha")
+	betaIdx := strings.Index(stdout, "beta")
+	if alphaIdx > betaIdx {
+		t.Fatalf("expected alpha (more obs) before beta, got: %q", stdout)
 	}
 }
 
-func TestCmdCloudLoginIntegration(t *testing.T) {
-	requestBody := struct {
-		Identifier string `json:"identifier"`
-		Password   string `json:"password"`
-	}{}
+func TestCmdProjectsRoutesSubcommands(t *testing.T) {
+	cfg := testConfig(t)
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" || r.URL.Path != "/auth/login" {
-			w.WriteHeader(404)
-			return
-		}
-		if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
-			t.Fatalf("decode login request: %v", err)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(200)
-		json.NewEncoder(w).Encode(auth.AuthResult{
-			UserID:       "u-existing",
-			Username:     "bob",
-			AccessToken:  "new-access-tok",
-			RefreshToken: "new-refresh-tok",
-			ExpiresIn:    3600,
-		})
-	}))
-	defer srv.Close()
-
-	oldScanner := stdinScanner
-	t.Cleanup(func() { stdinScanner = oldScanner })
-	stdinScanner = func() *bufio.Scanner {
-		return bufio.NewScanner(strings.NewReader("bob\npassword123\n"))
+	// "list" subcommand
+	withArgs(t, "engram", "projects", "list")
+	stdout, _ := captureOutput(t, func() { cmdProjects(cfg) })
+	if !strings.Contains(stdout, "No projects found") && !strings.Contains(stdout, "Projects") {
+		t.Fatalf("expected projects list output, got: %q", stdout)
 	}
 
-	oldClient := cloudHTTPClient
-	t.Cleanup(func() { cloudHTTPClient = oldClient })
-	cloudHTTPClient = func() *http.Client { return srv.Client() }
+	// default (no subcommand) → list
+	withArgs(t, "engram", "projects")
+	stdout2, _ := captureOutput(t, func() { cmdProjects(cfg) })
+	_ = stdout2 // just checking it doesn't crash
+}
 
-	tmpHome := t.TempDir()
-	dataDir := filepath.Join(tmpHome, ".engram")
+func TestCmdProjectsConsolidateNoSimilar(t *testing.T) {
+	cfg := testConfig(t)
 
-	withArgs(t, "engram", "cloud", "login", "--server", srv.URL)
-	stdout, stderr := captureOutput(t, func() { cmdCloudLogin(dataDir) })
+	// Seed a single unique project
+	mustSeedObservation(t, cfg, "s-unique", "unique-project", "note", "unique note", "content", "project")
+
+	// Set cwd to a temp dir named "unique-project" with no git
+	workDir := filepath.Join(t.TempDir(), "unique-project")
+	if err := os.MkdirAll(workDir, 0755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	withCwd(t, workDir)
+
+	// Stub detectProject to return the known canonical
+	old := detectProject
+	detectProject = func(string) string { return "unique-project" }
+	t.Cleanup(func() { detectProject = old })
+
+	withArgs(t, "engram", "projects", "consolidate")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
 	if stderr != "" {
 		t.Fatalf("expected no stderr, got: %q", stderr)
 	}
-	if !strings.Contains(stdout, "Logged in as bob") {
-		t.Fatalf("expected login success, got: %q", stdout)
-	}
-
-	cc, err := loadCloudConfig(dataDir)
-	if err != nil {
-		t.Fatalf("loadCloudConfig after login: %v", err)
-	}
-	if cc.Token != "new-access-tok" || cc.RefreshToken != "new-refresh-tok" || cc.Username != "bob" {
-		t.Fatalf("unexpected saved config: %+v", cc)
-	}
-	if requestBody.Identifier != "bob" {
-		t.Fatalf("expected identifier=bob, got %+v", requestBody)
-	}
-	if requestBody.Password != "password123" {
-		t.Fatalf("expected password to be forwarded, got %+v", requestBody)
+	if !strings.Contains(stdout, "No similar") {
+		t.Fatalf("expected no-similar message, got: %q", stdout)
 	}
 }
 
-func TestCmdCloudAPIKey(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "POST" || r.URL.Path != "/auth/api-key" {
-			w.WriteHeader(404)
-			return
-		}
-		if r.Header.Get("Authorization") != "Bearer my-cloud-token" {
-			w.WriteHeader(401)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(201)
-		json.NewEncoder(w).Encode(map[string]string{
-			"api_key": "eng_abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
-			"message": "Store this key securely. It will not be shown again.",
-		})
-	}))
-	defer srv.Close()
+func TestCmdProjectsConsolidateDryRun(t *testing.T) {
+	cfg := testConfig(t)
 
-	// Set up config with saved token
-	tmpHome := t.TempDir()
-	dataDir := filepath.Join(tmpHome, ".engram")
+	// Seed a canonical and a similar variant (substring match, distinct after normalize)
+	mustSeedObservation(t, cfg, "s-eng", "engram", "note", "eng note", "content", "project")
+	mustSeedObservation(t, cfg, "s-engm", "engram-memory", "note", "engm note", "content", "project")
 
-	saveCloudConfig(dataDir, &CloudConfig{
-		ServerURL: srv.URL,
-		Token:     "my-cloud-token",
-		UserID:    "u-api",
-		Username:  "apiuser",
-	})
+	old := detectProject
+	detectProject = func(string) string { return "engram" }
+	t.Cleanup(func() { detectProject = old })
 
-	oldClient := cloudHTTPClient
-	t.Cleanup(func() { cloudHTTPClient = oldClient })
-	cloudHTTPClient = func() *http.Client { return srv.Client() }
-
-	withArgs(t, "engram", "cloud", "api-key")
-	stdout, stderr := captureOutput(t, func() { cmdCloudAPIKey(dataDir) })
+	withArgs(t, "engram", "projects", "consolidate", "--dry-run")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
 	if stderr != "" {
 		t.Fatalf("expected no stderr, got: %q", stderr)
 	}
-	if !strings.Contains(stdout, "eng_") {
-		t.Fatalf("expected API key in output, got: %q", stdout)
+	if !strings.Contains(stdout, "dry-run") {
+		t.Fatalf("expected dry-run message, got: %q", stdout)
 	}
-	if !strings.Contains(stdout, "WARNING") {
-		t.Fatalf("expected warning message, got: %q", stdout)
-	}
-}
-
-func TestCmdCloudSyncFlagOverridesEnvAndConfigNoOp(t *testing.T) {
-	var manifestCalls int
-	var chunkCalls int
-	var pushCalls int
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer cli-token" {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-
-		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/sync/pull":
-			manifestCalls++
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]any{"version": 1, "chunks": []any{}})
-		case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/sync/pull/"):
-			chunkCalls++
-			w.WriteHeader(http.StatusNotFound)
-		case r.Method == http.MethodPost && r.URL.Path == "/sync/push":
-			pushCalls++
-			w.WriteHeader(http.StatusOK)
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer srv.Close()
-
-	t.Setenv("ENGRAM_REMOTE_URL", "http://env.invalid")
-	t.Setenv("ENGRAM_TOKEN", "env-token")
-
-	tmpHome := t.TempDir()
-	syncDataDir := filepath.Join(tmpHome, ".engram")
-	if err := saveCloudConfig(syncDataDir, &CloudConfig{ServerURL: "http://config.invalid", Token: "config-token"}); err != nil {
-		t.Fatalf("saveCloudConfig: %v", err)
-	}
-
-	oldClient := cloudHTTPClient
-	t.Cleanup(func() { cloudHTTPClient = oldClient })
-	cloudHTTPClient = func() *http.Client { return srv.Client() }
-
-	syncCfg := testConfig(t)
-	syncCfg.DataDir = syncDataDir
-	withArgs(t, "engram", "cloud", "sync", "--server", srv.URL, "--token", "cli-token", "--legacy")
-	stdout, stderr := captureOutput(t, func() { cmdCloudSync(syncCfg) })
-	if stderr != "" {
-		t.Fatalf("expected no stderr, got %q", stderr)
-	}
-	if !strings.Contains(stdout, "Nothing new to push") || !strings.Contains(stdout, "Nothing new to pull") {
-		t.Fatalf("unexpected output: %q", stdout)
-	}
-	if manifestCalls == 0 {
-		t.Fatal("expected manifest requests")
-	}
-	if pushCalls != 0 {
-		t.Fatalf("expected no push requests, got %d", pushCalls)
-	}
-	if chunkCalls != 0 {
-		t.Fatalf("expected no chunk downloads, got %d", chunkCalls)
-	}
-}
-
-func TestCmdCloudStatusEnvOverridesConfig(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer env-token" {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		if r.URL.Path != "/sync/pull" {
-			w.WriteHeader(http.StatusNotFound)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{
-			"version": 1,
-			"chunks": []map[string]any{{
-				"id":         "aabb1122",
-				"created_by": "alice",
-				"created_at": "2026-03-07T10:00:00Z",
-				"sessions":   1,
-				"memories":   2,
-				"prompts":    0,
-			}},
-		})
-	}))
-	defer srv.Close()
-
-	t.Setenv("ENGRAM_REMOTE_URL", srv.URL)
-	t.Setenv("ENGRAM_TOKEN", "env-token")
-
-	tmpHome := t.TempDir()
-	statusDataDir := filepath.Join(tmpHome, ".engram")
-	if err := saveCloudConfig(statusDataDir, &CloudConfig{ServerURL: "http://config.invalid", Token: "config-token", Username: "config-user"}); err != nil {
-		t.Fatalf("saveCloudConfig: %v", err)
-	}
-
-	oldClient := cloudHTTPClient
-	t.Cleanup(func() { cloudHTTPClient = oldClient })
-	cloudHTTPClient = func() *http.Client { return srv.Client() }
-
-	statusCfg := testConfig(t)
-	statusCfg.DataDir = statusDataDir
-	stdout, stderr := captureOutput(t, func() { cmdCloudStatus(statusCfg) })
-	if stderr != "" {
-		t.Fatalf("expected no stderr, got %q", stderr)
-	}
-	if !strings.Contains(stdout, srv.URL) {
-		t.Fatalf("expected env server url in output, got %q", stdout)
-	}
-	if !strings.Contains(stdout, "Remote chunks:   1") {
-		t.Fatalf("unexpected status output: %q", stdout)
-	}
-}
-
-// ─── Autosync / Sync-Status CLI Tests ────────────────────────────────────────
-
-func TestCmdCloudSyncStatusShowsState(t *testing.T) {
-	cfg := testConfig(t)
-	s, err := store.New(cfg)
-	if err != nil {
-		t.Fatalf("store.New: %v", err)
-	}
-
-	// Create a session to seed some data and trigger sync_state creation.
-	_ = s.CreateSession("test-session", "test-project", "/tmp")
-	s.Close()
-
-	withArgs(t, "engram", "cloud", "sync-status")
-	stdout, stderr := captureOutput(t, func() { cmdCloudSyncStatus(cfg) })
-	if stderr != "" {
-		t.Fatalf("expected no stderr, got %q", stderr)
-	}
-	// Should show lifecycle and pending info.
-	if !strings.Contains(stdout, "Lifecycle:") {
-		t.Fatalf("expected Lifecycle in output, got %q", stdout)
-	}
-	if !strings.Contains(stdout, "Pending mutations:") {
-		t.Fatalf("expected Pending mutations in output, got %q", stdout)
-	}
-}
-
-func TestCmdCloudSyncStatusUninitializedStore(t *testing.T) {
-	cfg := testConfig(t)
-
-	// Don't create any sessions — sync_state won't exist.
-	// Create the store just to initialize the DB.
-	s, err := store.New(cfg)
-	if err != nil {
-		t.Fatalf("store.New: %v", err)
-	}
-	s.Close()
-
-	withArgs(t, "engram", "cloud", "sync-status")
-	stdout, _ := captureOutput(t, func() { cmdCloudSyncStatus(cfg) })
-
-	// Sync state should either show or indicate not initialized.
-	// After Phase 1, sync_state row is lazily created, so it might say "not initialized"
-	// or show idle lifecycle depending on whether any writes happened.
-	if stdout == "" {
-		t.Fatal("expected some output from sync-status")
-	}
-}
-
-func TestCmdCloudSyncMutationEngine(t *testing.T) {
-	// Test the new mutation-based sync by mocking the push/pull endpoints.
-	var pushCalls int
-	var pullCalls int
-
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer test-token" {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-
-		switch {
-		case r.Method == http.MethodPost && r.URL.Path == "/sync/mutations/push":
-			pushCalls++
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]any{"accepted": 0, "last_seq": 0})
-		case r.Method == http.MethodGet && r.URL.Path == "/sync/mutations/pull":
-			pullCalls++
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]any{"mutations": []any{}, "has_more": false})
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer srv.Close()
-
-	tmpHome := t.TempDir()
-	oldHome := userHomeDir
-	t.Cleanup(func() { userHomeDir = oldHome })
-	userHomeDir = func() (string, error) { return tmpHome, nil }
-
-	oldClient := cloudHTTPClient
-	t.Cleanup(func() { cloudHTTPClient = oldClient })
-	cloudHTTPClient = func() *http.Client { return srv.Client() }
-
-	withArgs(t, "engram", "cloud", "sync", "--server", srv.URL, "--token", "test-token")
-	stdout, stderr := captureOutput(t, func() { cmdCloudSync(testConfig(t)) })
-	if stderr != "" {
-		t.Fatalf("expected no stderr, got %q", stderr)
-	}
-	if !strings.Contains(stdout, "Sync") {
-		t.Fatalf("expected Sync output, got %q", stdout)
-	}
-}
-
-func TestCmdCloudDispatchSyncStatus(t *testing.T) {
-	// Verify that "engram cloud sync-status" routes to cmdCloudSyncStatus.
-	cfg := testConfig(t)
-	s, err := store.New(cfg)
-	if err != nil {
-		t.Fatalf("store.New: %v", err)
-	}
-	s.Close()
-
-	withArgs(t, "engram", "cloud", "sync-status")
-	stdout, _ := captureOutput(t, func() { cmdCloudSyncStatus(cfg) })
-	if stdout == "" {
-		t.Fatal("expected output from sync-status command")
-	}
-}
-
-// ─── Enrollment CLI Tests ────────────────────────────────────────────────────
-
-func TestCmdCloudEnrollHappyPath(t *testing.T) {
-	cfg := testConfig(t)
-
-	withArgs(t, "engram", "cloud", "enroll", "my-project")
-	stdout, stderr := captureOutput(t, func() { cmdCloudEnroll(cfg) })
-	if stderr != "" {
-		t.Fatalf("expected no stderr, got: %q", stderr)
-	}
-	if !strings.Contains(stdout, `"my-project" enrolled for cloud sync`) {
-		t.Fatalf("unexpected enroll output: %q", stdout)
-	}
-
-	// Verify it's actually enrolled in the store.
+	// Verify no actual merge happened (both projects still exist)
 	s, err := store.New(cfg)
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
 	}
 	defer s.Close()
-
-	enrolled, err := s.IsProjectEnrolled("my-project")
+	names, err := s.ListProjectNames()
 	if err != nil {
-		t.Fatalf("IsProjectEnrolled: %v", err)
+		t.Fatalf("ListProjectNames: %v", err)
 	}
-	if !enrolled {
-		t.Fatal("expected project to be enrolled after enroll command")
-	}
-}
-
-func TestCmdCloudEnrollMissingArg(t *testing.T) {
-	exitCalled := false
-	oldExit := exitFunc
-	t.Cleanup(func() { exitFunc = oldExit })
-	exitFunc = func(code int) { exitCalled = true }
-
-	cfg := testConfig(t)
-	withArgs(t, "engram", "cloud", "enroll")
-	_, stderr := captureOutput(t, func() { cmdCloudEnroll(cfg) })
-
-	if !exitCalled {
-		t.Fatal("expected exit for missing project arg")
-	}
-	if !strings.Contains(stderr, "usage: engram cloud enroll") {
-		t.Fatalf("expected usage in stderr, got: %q", stderr)
+	// Should still have both names (no merge happened)
+	if len(names) < 2 {
+		t.Fatalf("expected 2 project names after dry-run, got: %v", names)
 	}
 }
 
-func TestCmdCloudEnrollIdempotent(t *testing.T) {
+func TestCmdProjectsConsolidateSingleProject(t *testing.T) {
 	cfg := testConfig(t)
 
-	// Enroll twice — should succeed both times.
-	withArgs(t, "engram", "cloud", "enroll", "idempotent-proj")
-	stdout1, stderr1 := captureOutput(t, func() { cmdCloudEnroll(cfg) })
-	if stderr1 != "" {
-		t.Fatalf("first enroll: unexpected stderr: %q", stderr1)
-	}
-	if !strings.Contains(stdout1, "enrolled") {
-		t.Fatalf("first enroll: unexpected output: %q", stdout1)
+	// Seed canonical and a similar variant (substring match, distinct after normalize)
+	mustSeedObservation(t, cfg, "s-eng", "engram", "note", "eng note", "content", "project")
+	mustSeedObservation(t, cfg, "s-engm", "engram-memory", "note", "engm note", "content", "project")
+
+	old := detectProject
+	detectProject = func(string) string { return "engram" }
+	t.Cleanup(func() { detectProject = old })
+
+	// Stub scanInputLine to answer "all"
+	oldScan := scanInputLine
+	t.Cleanup(func() { scanInputLine = oldScan })
+	scanInputLine = func(a ...any) (int, error) {
+		if ptr, ok := a[0].(*string); ok {
+			*ptr = "all"
+		}
+		return 1, nil
 	}
 
-	stdout2, stderr2 := captureOutput(t, func() { cmdCloudEnroll(cfg) })
-	if stderr2 != "" {
-		t.Fatalf("second enroll: unexpected stderr: %q", stderr2)
-	}
-	if !strings.Contains(stdout2, "enrolled") {
-		t.Fatalf("second enroll: unexpected output: %q", stdout2)
-	}
-}
-
-func TestCmdCloudUnenrollHappyPath(t *testing.T) {
-	cfg := testConfig(t)
-
-	// First enroll, then unenroll.
-	withArgs(t, "engram", "cloud", "enroll", "unenroll-proj")
-	captureOutput(t, func() { cmdCloudEnroll(cfg) })
-
-	withArgs(t, "engram", "cloud", "unenroll", "unenroll-proj")
-	stdout, stderr := captureOutput(t, func() { cmdCloudUnenroll(cfg) })
+	withArgs(t, "engram", "projects", "consolidate")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
 	if stderr != "" {
 		t.Fatalf("expected no stderr, got: %q", stderr)
 	}
-	if !strings.Contains(stdout, `"unenroll-proj" unenrolled`) {
-		t.Fatalf("unexpected unenroll output: %q", stdout)
+	if !strings.Contains(stdout, "Merged into") {
+		t.Fatalf("expected merge result, got: %q", stdout)
 	}
 
-	// Verify it's no longer enrolled.
+	// Verify engram-memory was merged into engram
 	s, err := store.New(cfg)
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
 	}
 	defer s.Close()
-
-	enrolled, err := s.IsProjectEnrolled("unenroll-proj")
+	names, err := s.ListProjectNames()
 	if err != nil {
-		t.Fatalf("IsProjectEnrolled: %v", err)
+		t.Fatalf("ListProjectNames: %v", err)
 	}
-	if enrolled {
-		t.Fatal("expected project to be unenrolled after unenroll command")
+	if len(names) != 1 || names[0] != "engram" {
+		t.Fatalf("expected only 'engram' after merge, got: %v", names)
 	}
 }
 
-func TestCmdCloudUnenrollMissingArg(t *testing.T) {
-	exitCalled := false
+func TestCmdProjectsConsolidateAllDryRun(t *testing.T) {
+	cfg := testConfig(t)
+
+	// Seed similar projects (substring match, stays distinct after normalize)
+	mustSeedObservation(t, cfg, "s-eng", "engram", "note", "eng note", "content", "project")
+	mustSeedObservation(t, cfg, "s-engm", "engram-memory", "note", "engm note", "content", "project")
+
+	withArgs(t, "engram", "projects", "consolidate", "--all", "--dry-run")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "dry-run") || !strings.Contains(stdout, "Group") {
+		t.Fatalf("expected dry-run group output, got: %q", stdout)
+	}
+}
+
+func TestCmdProjectsAllNoGroups(t *testing.T) {
+	cfg := testConfig(t)
+
+	// Seed completely unrelated projects
+	mustSeedObservation(t, cfg, "s-foo", "fooproject", "note", "foo", "content", "project")
+	mustSeedObservation(t, cfg, "s-bar", "barproject", "note", "bar", "content", "project")
+	mustSeedObservation(t, cfg, "s-qux", "quxproject", "note", "qux", "content", "project")
+
+	withArgs(t, "engram", "projects", "consolidate", "--all")
+	stdout, stderr := captureOutput(t, func() { cmdProjectsConsolidate(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	// The three "project"-suffixed names might be grouped by similarity.
+	// We just verify it runs without error and produces readable output.
+	_ = stdout
+}
+
+func TestCmdMCPDetectsProjectFromFlag(t *testing.T) {
+	// JR2-4: --project flag is no longer used (dead code removed). The --project flag
+	// is now silently ignored; project is auto-detected from cwd at each MCP call.
+	// This test verifies cmdMCP still starts correctly when an unknown flag is passed.
+	cfg := testConfig(t)
+
+	var capturedCfg mcp.MCPConfig
+	oldNew := newMCPServerWithConfig
+	t.Cleanup(func() { newMCPServerWithConfig = oldNew })
+	newMCPServerWithConfig = func(s *store.Store, mcpCfg mcp.MCPConfig, allowlist map[string]bool) *mcpserver.MCPServer {
+		capturedCfg = mcpCfg
+		// Return a valid server so serveMCP doesn't panic
+		return oldNew(s, mcpCfg, allowlist)
+	}
+
+	oldServe := serveMCP
+	t.Cleanup(func() { serveMCP = oldServe })
+	// Prevent actual stdio serve — return immediately
+	serveMCP = func(srv *mcpserver.MCPServer, opts ...mcpserver.StdioOption) error {
+		return nil
+	}
+
+	withArgs(t, "engram", "mcp", "--project=myproject")
+	_, _ = captureOutput(t, func() { cmdMCP(cfg) })
+
+	// JW6: MCPConfig.DefaultProject removed — verify cmdMCP still calls newMCPServerWithConfig.
+	// The project flag is parsed but project is now auto-detected per call, not stored in config.
+	_ = capturedCfg // MCPConfig{} — no fields to assert
+}
+
+func TestCmdMCPDetectsProjectFromEnv(t *testing.T) {
+	cfg := testConfig(t)
+
+	t.Setenv("ENGRAM_PROJECT", "env-project")
+
+	var capturedCfg mcp.MCPConfig
+	oldNew := newMCPServerWithConfig
+	t.Cleanup(func() { newMCPServerWithConfig = oldNew })
+	newMCPServerWithConfig = func(s *store.Store, mcpCfg mcp.MCPConfig, allowlist map[string]bool) *mcpserver.MCPServer {
+		capturedCfg = mcpCfg
+		return oldNew(s, mcpCfg, allowlist)
+	}
+
+	oldServe := serveMCP
+	t.Cleanup(func() { serveMCP = oldServe })
+	serveMCP = func(srv *mcpserver.MCPServer, opts ...mcpserver.StdioOption) error {
+		return nil
+	}
+
+	withArgs(t, "engram", "mcp")
+	_, _ = captureOutput(t, func() { cmdMCP(cfg) })
+
+	// JW6: MCPConfig.DefaultProject removed — just verify cmdMCP completes without panic.
+	_ = capturedCfg
+}
+
+func TestCmdMCPDetectsProjectFromGit(t *testing.T) {
+	cfg := testConfig(t)
+
+	// Stub detectProject to simulate git detection
+	old := detectProject
+	t.Cleanup(func() { detectProject = old })
+	detectProject = func(string) string { return "detected-from-git" }
+
+	var capturedCfg mcp.MCPConfig
+	oldNew := newMCPServerWithConfig
+	t.Cleanup(func() { newMCPServerWithConfig = oldNew })
+	newMCPServerWithConfig = func(s *store.Store, mcpCfg mcp.MCPConfig, allowlist map[string]bool) *mcpserver.MCPServer {
+		capturedCfg = mcpCfg
+		return oldNew(s, mcpCfg, allowlist)
+	}
+
+	oldServe := serveMCP
+	t.Cleanup(func() { serveMCP = oldServe })
+	serveMCP = func(srv *mcpserver.MCPServer, opts ...mcpserver.StdioOption) error {
+		return nil
+	}
+
+	withArgs(t, "engram", "mcp")
+	_, _ = captureOutput(t, func() { cmdMCP(cfg) })
+
+	// JW6: MCPConfig.DefaultProject removed — just verify cmdMCP completes without panic.
+	_ = capturedCfg
+}
+
+func TestCmdSyncUsesDetectProject(t *testing.T) {
+	workDir := t.TempDir()
+	withCwd(t, workDir)
+
+	cfg := testConfig(t)
+
+	// Stub detectProject to verify it's called instead of filepath.Base
+	old := detectProject
+	t.Cleanup(func() { detectProject = old })
+	detectProject = func(dir string) string { return "git-detected-project" }
+
+	withArgs(t, "engram", "sync")
+	stdout, stderr := captureOutput(t, func() { cmdSync(cfg) })
+	if stderr != "" {
+		t.Fatalf("expected no stderr, got: %q", stderr)
+	}
+	if !strings.Contains(stdout, "git-detected-project") {
+		t.Fatalf("expected detectProject result in output, got: %q", stdout)
+	}
+}
+
+// ─── obsidian-export command tests ───────────────────────────────────────────
+
+// TestObsidianExportMissingVault verifies that omitting --vault exits with code 1
+// and prints an error message to stderr (REQ-EXPORT-01: missing --vault scenario).
+func TestObsidianExportMissingVault(t *testing.T) {
+	cfg := testConfig(t)
+
+	var exitCode int
 	oldExit := exitFunc
 	t.Cleanup(func() { exitFunc = oldExit })
-	exitFunc = func(code int) { exitCalled = true }
+	exitFunc = func(code int) { exitCode = code; panic("exit") }
 
-	cfg := testConfig(t)
-	withArgs(t, "engram", "cloud", "unenroll")
-	_, stderr := captureOutput(t, func() { cmdCloudUnenroll(cfg) })
+	withArgs(t, "engram", "obsidian-export", "--project", "eng")
 
-	if !exitCalled {
-		t.Fatal("expected exit for missing project arg")
+	// Capture stderr before the panic unwinds by closing pipes inside captureOutput.
+	// We use a wrapper that recovers from the exitFunc panic and then still closes
+	// the write-end pipes so ReadAll can drain them.
+	oldOut := os.Stdout
+	oldErr := os.Stderr
+	outR, outW, _ := os.Pipe()
+	errR, errW, _ := os.Pipe()
+	os.Stdout = outW
+	os.Stderr = errW
+
+	func() {
+		defer func() {
+			recover() //nolint:errcheck
+		}()
+		cmdObsidianExport(cfg)
+	}()
+
+	_ = outW.Close()
+	_ = errW.Close()
+	os.Stdout = oldOut
+	os.Stderr = oldErr
+
+	errBytes, _ := io.ReadAll(errR)
+	_, _ = io.ReadAll(outR)
+	stderr := string(errBytes)
+
+	if exitCode != 1 {
+		t.Fatalf("expected exit code 1, got %d", exitCode)
 	}
-	if !strings.Contains(stderr, "usage: engram cloud unenroll") {
-		t.Fatalf("expected usage in stderr, got: %q", stderr)
+	if !strings.Contains(stderr, "--vault") {
+		t.Fatalf("expected '--vault' in stderr, got: %q", stderr)
 	}
 }
 
-func TestCmdCloudUnenrollIdempotent(t *testing.T) {
+// TestObsidianExportCallsInjectedExporter verifies that when --vault is provided,
+// the injected newObsidianExporter is called with the correct config
+// (REQ-EXPORT-01: happy path with all flags).
+func TestObsidianExportCallsInjectedExporter(t *testing.T) {
 	cfg := testConfig(t)
+	vaultDir := t.TempDir()
 
-	// Unenroll a project that was never enrolled — should succeed (idempotent).
-	withArgs(t, "engram", "cloud", "unenroll", "never-enrolled")
-	stdout, stderr := captureOutput(t, func() { cmdCloudUnenroll(cfg) })
-	if stderr != "" {
-		t.Fatalf("expected no stderr, got: %q", stderr)
+	// Track the ExportConfig passed to the injected constructor
+	var capturedCfg obsidian.ExportConfig
+	exporterCalled := false
+
+	oldNew := newObsidianExporter
+	t.Cleanup(func() { newObsidianExporter = oldNew })
+	newObsidianExporter = func(s obsidian.StoreReader, c obsidian.ExportConfig) *obsidian.Exporter {
+		capturedCfg = c
+		exporterCalled = true
+		return obsidian.NewExporter(s, c)
 	}
-	if !strings.Contains(stdout, "unenrolled") {
-		t.Fatalf("unexpected output: %q", stdout)
+
+	withArgs(t, "engram", "obsidian-export",
+		"--vault", vaultDir,
+		"--project", "eng",
+		"--limit", "50",
+		"--since", "2026-01-01",
+	)
+
+	_, _ = captureOutput(t, func() { cmdObsidianExport(cfg) })
+
+	if !exporterCalled {
+		t.Fatalf("expected newObsidianExporter to be called")
+	}
+	if capturedCfg.VaultPath != vaultDir {
+		t.Fatalf("expected VaultPath=%q, got %q", vaultDir, capturedCfg.VaultPath)
+	}
+	if capturedCfg.Project != "eng" {
+		t.Fatalf("expected Project=%q, got %q", "eng", capturedCfg.Project)
+	}
+	if capturedCfg.Limit != 50 {
+		t.Fatalf("expected Limit=50, got %d", capturedCfg.Limit)
+	}
+	if capturedCfg.Since.IsZero() {
+		t.Fatalf("expected Since to be set from --since 2026-01-01, got zero")
 	}
 }
 
-func TestCmdCloudProjectsEmpty(t *testing.T) {
+// TestObsidianExportMinimalFlags verifies that only --vault (the required flag)
+// is sufficient — optional flags default to zero values (triangulation case).
+func TestObsidianExportMinimalFlags(t *testing.T) {
 	cfg := testConfig(t)
+	vaultDir := t.TempDir()
 
-	withArgs(t, "engram", "cloud", "projects")
-	stdout, stderr := captureOutput(t, func() { cmdCloudProjects(cfg) })
-	if stderr != "" {
-		t.Fatalf("expected no stderr, got: %q", stderr)
+	var capturedCfg obsidian.ExportConfig
+	oldNew := newObsidianExporter
+	t.Cleanup(func() { newObsidianExporter = oldNew })
+	newObsidianExporter = func(s obsidian.StoreReader, c obsidian.ExportConfig) *obsidian.Exporter {
+		capturedCfg = c
+		return obsidian.NewExporter(s, c)
 	}
-	if !strings.Contains(stdout, "No projects enrolled") {
-		t.Fatalf("expected empty message, got: %q", stdout)
+
+	withArgs(t, "engram", "obsidian-export", "--vault", vaultDir)
+
+	_, _ = captureOutput(t, func() { cmdObsidianExport(cfg) })
+
+	if capturedCfg.VaultPath != vaultDir {
+		t.Fatalf("expected VaultPath=%q, got %q", vaultDir, capturedCfg.VaultPath)
 	}
-	if !strings.Contains(stdout, "engram cloud enroll") {
-		t.Fatalf("expected hint about enroll command, got: %q", stdout)
+	// Optional flags should be zero
+	if capturedCfg.Project != "" {
+		t.Fatalf("expected empty Project, got %q", capturedCfg.Project)
+	}
+	if capturedCfg.Limit != 0 {
+		t.Fatalf("expected Limit=0, got %d", capturedCfg.Limit)
+	}
+	if !capturedCfg.Since.IsZero() {
+		t.Fatalf("expected Since=zero, got %v", capturedCfg.Since)
 	}
 }
 
-func TestCmdCloudProjectsWithEntries(t *testing.T) {
-	cfg := testConfig(t)
-
-	// Enroll two projects.
-	withArgs(t, "engram", "cloud", "enroll", "alpha")
-	captureOutput(t, func() { cmdCloudEnroll(cfg) })
-	withArgs(t, "engram", "cloud", "enroll", "bravo")
-	captureOutput(t, func() { cmdCloudEnroll(cfg) })
-
-	withArgs(t, "engram", "cloud", "projects")
-	stdout, stderr := captureOutput(t, func() { cmdCloudProjects(cfg) })
-	if stderr != "" {
-		t.Fatalf("expected no stderr, got: %q", stderr)
-	}
-	if !strings.Contains(stdout, "Enrolled projects (2)") {
-		t.Fatalf("expected 2 projects header, got: %q", stdout)
-	}
-	if !strings.Contains(stdout, "alpha") || !strings.Contains(stdout, "bravo") {
-		t.Fatalf("expected both projects listed, got: %q", stdout)
-	}
-}
-
-func TestCmdCloudDispatchEnrollUnenrollProjects(t *testing.T) {
-	cfg := testConfig(t)
-
-	// Test that dispatch routes to the new commands correctly.
-	withArgs(t, "engram", "cloud", "enroll", "dispatch-proj")
-	stdout, stderr := captureOutput(t, func() { cmdCloud(cfg) })
-	if stderr != "" {
-		t.Fatalf("enroll dispatch: unexpected stderr: %q", stderr)
-	}
-	if !strings.Contains(stdout, "enrolled") {
-		t.Fatalf("enroll dispatch: unexpected output: %q", stdout)
-	}
-
-	withArgs(t, "engram", "cloud", "projects")
-	stdout, stderr = captureOutput(t, func() { cmdCloud(cfg) })
-	if stderr != "" {
-		t.Fatalf("projects dispatch: unexpected stderr: %q", stderr)
-	}
-	if !strings.Contains(stdout, "dispatch-proj") {
-		t.Fatalf("projects dispatch: unexpected output: %q", stdout)
-	}
-
-	withArgs(t, "engram", "cloud", "unenroll", "dispatch-proj")
-	stdout, stderr = captureOutput(t, func() { cmdCloud(cfg) })
-	if stderr != "" {
-		t.Fatalf("unenroll dispatch: unexpected stderr: %q", stderr)
-	}
-	if !strings.Contains(stdout, "unenrolled") {
-		t.Fatalf("unenroll dispatch: unexpected output: %q", stdout)
-	}
-}
-
-func TestPrintUsageIncludesEnrollmentCommands(t *testing.T) {
-	oldVersion := version
-	version = "test-version"
-	t.Cleanup(func() { version = oldVersion })
-
+// TestObsidianExportInHelpText verifies that "obsidian-export" appears in printUsage output.
+func TestObsidianExportInHelpText(t *testing.T) {
 	stdout, _ := captureOutput(t, func() { printUsage() })
-
-	enrollItems := []string{
-		"cloud enroll",
-		"cloud unenroll",
-		"cloud projects",
-	}
-	for _, item := range enrollItems {
-		if !strings.Contains(stdout, item) {
-			t.Errorf("usage output missing %q", item)
-		}
+	if !strings.Contains(stdout, "obsidian-export") {
+		t.Fatalf("expected 'obsidian-export' in help text, got: %q", stdout)
 	}
 }
 
-// ─── Integration: Round-Trip Enrollment + Sync Filtering ─────────────────────
+// ─── obsidian-export Phase 4 tests (graph-config, watch, interval) ───────────
 
-func TestEnrollmentRoundTripFilteredSync(t *testing.T) {
-	// Full round-trip: enroll project → write observation → verify mutation has project
-	// → verify ListPendingSyncMutations only returns enrolled mutations.
+// captureExitPanic is a helper that runs fn inside a panic-recovering wrapper,
+// captures stdout/stderr via os.Pipe, and returns the exit code (via exitFunc stub).
+func captureExitPanic(t *testing.T, fn func()) (stdout, stderr string, exitCode int) {
+	t.Helper()
+
+	oldExit := exitFunc
+	t.Cleanup(func() { exitFunc = oldExit })
+	exitFunc = func(code int) { exitCode = code; panic("exit") }
+
+	oldOut := os.Stdout
+	oldErr := os.Stderr
+	outR, outW, _ := os.Pipe()
+	errR, errW, _ := os.Pipe()
+	os.Stdout = outW
+	os.Stderr = errW
+
+	func() {
+		defer func() { recover() }() //nolint:errcheck
+		fn()
+	}()
+
+	_ = outW.Close()
+	_ = errW.Close()
+	os.Stdout = oldOut
+	os.Stderr = oldErr
+
+	outBytes, _ := io.ReadAll(outR)
+	errBytes, _ := io.ReadAll(errR)
+	return string(outBytes), string(errBytes), exitCode
+}
+
+// TestObsidianExportGraphConfigInvalid verifies that --graph-config with an
+// invalid value exits 1 and prints an error to stderr. (REQ-GRAPH-01)
+func TestObsidianExportGraphConfigInvalid(t *testing.T) {
 	cfg := testConfig(t)
+	vaultDir := t.TempDir()
 
-	s, err := store.New(cfg)
-	if err != nil {
-		t.Fatalf("store.New: %v", err)
-	}
+	withArgs(t, "engram", "obsidian-export",
+		"--vault", vaultDir,
+		"--graph-config", "bananas",
+	)
 
-	// 1. Enroll "sync-proj" for cloud sync.
-	if err := s.EnrollProject("sync-proj"); err != nil {
-		t.Fatalf("EnrollProject: %v", err)
-	}
+	_, stderr, code := captureExitPanic(t, func() { cmdObsidianExport(cfg) })
 
-	// 2. Create session + observation for enrolled project.
-	if err := s.CreateSession("s-enrolled", "sync-proj", "/tmp"); err != nil {
-		t.Fatalf("CreateSession: %v", err)
+	if code != 1 {
+		t.Fatalf("expected exit code 1, got %d", code)
 	}
-	_, err = s.AddObservation(store.AddObservationParams{
-		SessionID: "s-enrolled",
-		Type:      "decision",
-		Title:     "enrolled observation",
-		Content:   "this should sync",
-		Project:   "sync-proj",
-		Scope:     "project",
-	})
-	if err != nil {
-		t.Fatalf("AddObservation (enrolled): %v", err)
+	if !strings.Contains(stderr, "graph-config") {
+		t.Fatalf("expected 'graph-config' in stderr, got: %q", stderr)
 	}
-
-	// 3. Create session + observation for non-enrolled project.
-	if err := s.CreateSession("s-not-enrolled", "private-proj", "/tmp"); err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-	_, err = s.AddObservation(store.AddObservationParams{
-		SessionID: "s-not-enrolled",
-		Type:      "note",
-		Title:     "non-enrolled observation",
-		Content:   "this should NOT sync",
-		Project:   "private-proj",
-		Scope:     "project",
-	})
-	if err != nil {
-		t.Fatalf("AddObservation (non-enrolled): %v", err)
-	}
-
-	// 4. List pending mutations — only enrolled project's mutations should appear.
-	mutations, err := s.ListPendingSyncMutations(store.DefaultSyncTargetKey, 100)
-	if err != nil {
-		t.Fatalf("ListPendingSyncMutations: %v", err)
-	}
-
-	for _, m := range mutations {
-		if m.Project == "private-proj" {
-			t.Fatalf("non-enrolled project mutation leaked into pending list: %+v", m)
-		}
-	}
-
-	// Verify at least one enrolled mutation exists.
-	found := false
-	for _, m := range mutations {
-		if m.Project == "sync-proj" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatal("expected at least one mutation from enrolled project 'sync-proj'")
-	}
-
-	// 5. Skip-ack non-enrolled mutations to verify they get cleaned up.
-	skipped, err := s.SkipAckNonEnrolledMutations(store.DefaultSyncTargetKey)
-	if err != nil {
-		t.Fatalf("SkipAckNonEnrolledMutations: %v", err)
-	}
-	if skipped == 0 {
-		t.Fatal("expected at least one mutation to be skip-acked for non-enrolled project")
-	}
-
-	s.Close()
 }
 
-func TestSkipAckDoesNotTouchEmptyProjectMutations(t *testing.T) {
-	// Verify skip-ack doesn't touch empty-project mutations.
+// TestObsidianExportGraphConfigDefaultsToPreserve verifies that when --graph-config
+// is not set, the exporter is called with GraphConfigPreserve. (REQ-GRAPH-01)
+func TestObsidianExportGraphConfigDefaultsToPreserve(t *testing.T) {
 	cfg := testConfig(t)
+	vaultDir := t.TempDir()
 
-	s, err := store.New(cfg)
-	if err != nil {
-		t.Fatalf("store.New: %v", err)
-	}
-
-	// Create a session with empty project (no project).
-	if err := s.CreateSession("s-empty-proj", "", "/tmp"); err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-	_, err = s.AddObservation(store.AddObservationParams{
-		SessionID: "s-empty-proj",
-		Type:      "note",
-		Title:     "global observation",
-		Content:   "no project set",
-		Project:   "",
-		Scope:     "project",
-	})
-	if err != nil {
-		t.Fatalf("AddObservation (empty project): %v", err)
+	var capturedCfg obsidian.ExportConfig
+	oldNew := newObsidianExporter
+	t.Cleanup(func() { newObsidianExporter = oldNew })
+	newObsidianExporter = func(s obsidian.StoreReader, c obsidian.ExportConfig) *obsidian.Exporter {
+		capturedCfg = c
+		return obsidian.NewExporter(s, c)
 	}
 
-	// Enroll some other project so there's a distinction.
-	if err := s.EnrollProject("other-proj"); err != nil {
-		t.Fatalf("EnrollProject: %v", err)
-	}
+	withArgs(t, "engram", "obsidian-export", "--vault", vaultDir)
 
-	// Skip-ack should NOT touch empty-project mutations.
-	skipped, err := s.SkipAckNonEnrolledMutations(store.DefaultSyncTargetKey)
-	if err != nil {
-		t.Fatalf("SkipAckNonEnrolledMutations: %v", err)
-	}
-	if skipped != 0 {
-		t.Fatalf("expected 0 mutations skipped for empty project, got %d", skipped)
-	}
+	_, _ = captureOutput(t, func() { cmdObsidianExport(cfg) })
 
-	// Empty-project mutations should still be in the pending list.
-	mutations, err := s.ListPendingSyncMutations(store.DefaultSyncTargetKey, 100)
-	if err != nil {
-		t.Fatalf("ListPendingSyncMutations: %v", err)
+	if capturedCfg.GraphConfig != obsidian.GraphConfigPreserve {
+		t.Fatalf("expected GraphConfig=%q (preserve), got %q", obsidian.GraphConfigPreserve, capturedCfg.GraphConfig)
 	}
-	if len(mutations) == 0 {
-		t.Fatal("expected empty-project mutations to remain in pending list")
-	}
-
-	s.Close()
 }
 
-func TestEnrollWriteUnenrollVerifyFiltering(t *testing.T) {
-	// Enroll → write → unenroll → verify mutations are no longer returned.
+// TestObsidianExportWatchRequiresInterval verifies that --watch alone uses
+// the default 10m interval and does NOT exit with an error. (REQ-WATCH-02)
+func TestObsidianExportWatchRequiresInterval(t *testing.T) {
 	cfg := testConfig(t)
+	vaultDir := t.TempDir()
 
-	s, err := store.New(cfg)
-	if err != nil {
-		t.Fatalf("store.New: %v", err)
-	}
-
-	if err := s.EnrollProject("temp-proj"); err != nil {
-		t.Fatalf("EnrollProject: %v", err)
-	}
-	if err := s.CreateSession("s-temp", "temp-proj", "/tmp"); err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-	_, err = s.AddObservation(store.AddObservationParams{
-		SessionID: "s-temp",
-		Type:      "note",
-		Title:     "temp observation",
-		Content:   "before unenroll",
-		Project:   "temp-proj",
-		Scope:     "project",
-	})
-	if err != nil {
-		t.Fatalf("AddObservation: %v", err)
+	// Inject a fake watcher that records the call and returns immediately.
+	var watcherCalled bool
+	var capturedInterval time.Duration
+	oldWatcher := newObsidianWatcher
+	t.Cleanup(func() { newObsidianWatcher = oldWatcher })
+	newObsidianWatcher = func(wc obsidian.WatcherConfig) *obsidian.Watcher {
+		watcherCalled = true
+		capturedInterval = wc.Interval
+		return nil // nil signals the CLI to skip watcher.Run()
 	}
 
-	// Verify mutation is pending while enrolled.
-	mutations, err := s.ListPendingSyncMutations(store.DefaultSyncTargetKey, 100)
-	if err != nil {
-		t.Fatalf("ListPendingSyncMutations before unenroll: %v", err)
-	}
-	foundBefore := false
-	for _, m := range mutations {
-		if m.Project == "temp-proj" {
-			foundBefore = true
-		}
-	}
-	if !foundBefore {
-		t.Fatal("expected mutation from 'temp-proj' while enrolled")
-	}
+	withArgs(t, "engram", "obsidian-export", "--vault", vaultDir, "--watch")
 
-	// Unenroll the project.
-	if err := s.UnenrollProject("temp-proj"); err != nil {
-		t.Fatalf("UnenrollProject: %v", err)
-	}
+	// --watch with nil watcher should not panic and should not exit 1
+	var exitCode int
+	oldExit := exitFunc
+	t.Cleanup(func() { exitFunc = oldExit })
+	exitFunc = func(code int) { exitCode = code; panic("exit") }
 
-	// After unenroll, mutations from that project should no longer appear.
-	mutations, err = s.ListPendingSyncMutations(store.DefaultSyncTargetKey, 100)
-	if err != nil {
-		t.Fatalf("ListPendingSyncMutations after unenroll: %v", err)
-	}
-	for _, m := range mutations {
-		if m.Project == "temp-proj" {
-			t.Fatalf("mutation from unenrolled project 'temp-proj' still appears: %+v", m)
-		}
-	}
+	func() {
+		defer func() { recover() }() //nolint:errcheck
+		_, _ = captureOutput(t, func() { cmdObsidianExport(cfg) })
+	}()
 
-	s.Close()
+	// Exit code should be 0 (clean exit after watcher returns nil)
+	if exitCode != 0 {
+		t.Fatalf("expected exit code 0, got %d", exitCode)
+	}
+	if !watcherCalled {
+		t.Fatalf("expected newObsidianWatcher to be called")
+	}
+	if capturedInterval != 10*time.Minute {
+		t.Fatalf("expected default interval 10m, got %v", capturedInterval)
+	}
 }
 
-// Ensure unused imports don't cause issues — these are used above
-var _ = auth.AuthResult{}
-var _ = (*cloudstore.CloudStore)(nil)
-var _ = (*cloudserver.CloudServer)(nil)
-var _ = remote.NewRemoteTransport
+// TestObsidianExportIntervalWithoutWatchErrors verifies that --interval without
+// --watch exits 1. (REQ-WATCH-07)
+func TestObsidianExportIntervalWithoutWatchErrors(t *testing.T) {
+	cfg := testConfig(t)
+	vaultDir := t.TempDir()
+
+	withArgs(t, "engram", "obsidian-export",
+		"--vault", vaultDir,
+		"--interval", "5m",
+	)
+
+	_, stderr, code := captureExitPanic(t, func() { cmdObsidianExport(cfg) })
+
+	if code != 1 {
+		t.Fatalf("expected exit code 1, got %d", code)
+	}
+	if !strings.Contains(stderr, "--interval") && !strings.Contains(stderr, "watch") {
+		t.Fatalf("expected '--interval' or 'watch' in stderr, got: %q", stderr)
+	}
+}
+
+// TestObsidianExportIntervalBelowMinimumErrors verifies that --watch --interval 30s
+// exits 1 because the interval is below the 1-minute minimum. (REQ-WATCH-07)
+func TestObsidianExportIntervalBelowMinimumErrors(t *testing.T) {
+	cfg := testConfig(t)
+	vaultDir := t.TempDir()
+
+	withArgs(t, "engram", "obsidian-export",
+		"--vault", vaultDir,
+		"--watch",
+		"--interval", "30s",
+	)
+
+	_, stderr, code := captureExitPanic(t, func() { cmdObsidianExport(cfg) })
+
+	if code != 1 {
+		t.Fatalf("expected exit code 1, got %d", code)
+	}
+	if !strings.Contains(stderr, "1m") && !strings.Contains(stderr, "minimum") {
+		t.Fatalf("expected minimum interval message in stderr, got: %q", stderr)
+	}
+}
+
+// TestObsidianExportIntervalUnparseableErrors verifies that --watch --interval banana
+// exits 1 with a parse error. (REQ-WATCH-07)
+func TestObsidianExportIntervalUnparseableErrors(t *testing.T) {
+	cfg := testConfig(t)
+	vaultDir := t.TempDir()
+
+	withArgs(t, "engram", "obsidian-export",
+		"--vault", vaultDir,
+		"--watch",
+		"--interval", "banana",
+	)
+
+	_, stderr, code := captureExitPanic(t, func() { cmdObsidianExport(cfg) })
+
+	if code != 1 {
+		t.Fatalf("expected exit code 1, got %d", code)
+	}
+	if !strings.Contains(stderr, "interval") {
+		t.Fatalf("expected 'interval' in stderr, got: %q", stderr)
+	}
+}
+
+// TestObsidianExportWatchModeCallsInjectedWatcher verifies that with --watch,
+// the injected newObsidianWatcher is called with the correct WatcherConfig.
+// Uses a fake that records the call. (REQ-WATCH-01)
+func TestObsidianExportWatchModeCallsInjectedWatcher(t *testing.T) {
+	cfg := testConfig(t)
+	vaultDir := t.TempDir()
+
+	var watcherCfg obsidian.WatcherConfig
+	watcherCalled := false
+	oldWatcher := newObsidianWatcher
+	t.Cleanup(func() { newObsidianWatcher = oldWatcher })
+	newObsidianWatcher = func(wc obsidian.WatcherConfig) *obsidian.Watcher {
+		watcherCalled = true
+		watcherCfg = wc
+		return nil // nil means Run() is skipped; clean exit
+	}
+
+	withArgs(t, "engram", "obsidian-export",
+		"--vault", vaultDir,
+		"--watch",
+		"--interval", "2m",
+	)
+
+	var exitCode int
+	oldExit := exitFunc
+	t.Cleanup(func() { exitFunc = oldExit })
+	exitFunc = func(code int) { exitCode = code; panic("exit") }
+
+	func() {
+		defer func() { recover() }() //nolint:errcheck
+		_, _ = captureOutput(t, func() { cmdObsidianExport(cfg) })
+	}()
+
+	if exitCode != 0 {
+		t.Fatalf("expected clean exit (0), got %d", exitCode)
+	}
+	if !watcherCalled {
+		t.Fatalf("expected newObsidianWatcher to be called")
+	}
+	if watcherCfg.Interval != 2*time.Minute {
+		t.Fatalf("expected interval 2m, got %v", watcherCfg.Interval)
+	}
+	if watcherCfg.Exporter == nil {
+		t.Fatalf("expected non-nil Exporter in WatcherConfig")
+	}
+	if watcherCfg.Logf == nil {
+		t.Fatalf("expected non-nil Logf in WatcherConfig")
+	}
+}

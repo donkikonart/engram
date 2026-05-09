@@ -10,6 +10,7 @@ import templruntime "github.com/a-h/templ/runtime"
 
 // Layout wraps page content in the base HTML shell with nav, head, and footer.
 // activeTab should be one of: "dashboard", "browser", "projects", "contributors", "admin".
+// ADAPTED: username comes from Principal.DisplayName() at the call site (no context reads).
 func Layout(title string, username string, activeTab string, isAdmin bool, content templ.Component) templ.Component {
 	return templruntime.GeneratedTemplate(func(templ_7745c5c3_Input templruntime.GeneratedComponentInput) (templ_7745c5c3_Err error) {
 		templ_7745c5c3_W, ctx := templ_7745c5c3_Input.Writer, templ_7745c5c3_Input.Context
@@ -38,7 +39,7 @@ func Layout(title string, username string, activeTab string, isAdmin bool, conte
 		var templ_7745c5c3_Var2 string
 		templ_7745c5c3_Var2, templ_7745c5c3_Err = templ.JoinStringErrs(title)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/cloud/dashboard/layout.templ`, Line: 11, Col: 17}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/cloud/dashboard/layout.templ`, Line: 12, Col: 17}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var2))
 		if templ_7745c5c3_Err != nil {
@@ -51,13 +52,13 @@ func Layout(title string, username string, activeTab string, isAdmin bool, conte
 		var templ_7745c5c3_Var3 string
 		templ_7745c5c3_Var3, templ_7745c5c3_Err = templ.JoinStringErrs(username)
 		if templ_7745c5c3_Err != nil {
-			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/cloud/dashboard/layout.templ`, Line: 29, Col: 41}
+			return templ.Error{Err: templ_7745c5c3_Err, FileName: `internal/cloud/dashboard/layout.templ`, Line: 30, Col: 41}
 		}
 		_, templ_7745c5c3_Err = templ_7745c5c3_Buffer.WriteString(templ.EscapeString(templ_7745c5c3_Var3))
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}
-		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 3, "</span><form method=\"post\" action=\"/dashboard/logout\" style=\"margin:0\"><button type=\"submit\" class=\"outline secondary shell-button\">Logout</button></form></div></header><nav class=\"shell-nav\">")
+		templ_7745c5c3_Err = templruntime.WriteString(templ_7745c5c3_Buffer, 3, "</span><form method=\"post\" action=\"/dashboard/logout\" style=\"margin:0\"><button type=\"submit\" class=\"user-link logout-link\">Logout</button></form></div></header><nav class=\"shell-nav\">")
 		if templ_7745c5c3_Err != nil {
 			return templ_7745c5c3_Err
 		}

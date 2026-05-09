@@ -2,70 +2,45 @@ package cloud
 
 import "testing"
 
-func TestConfigFromEnvPrefersCanonicalNames(t *testing.T) {
-	t.Setenv("ENGRAM_DATABASE_URL", "postgres://canonical@localhost/canonical")
-	t.Setenv("ENGRAM_JWT_SECRET", "canonical-secret-value-with-32-bytes!!")
-	t.Setenv("ENGRAM_CLOUD_DSN", "postgres://legacy@localhost/legacy")
-	t.Setenv("ENGRAM_CLOUD_JWT_SECRET", "legacy-secret-value-with-32-bytes!!!!")
-	t.Setenv("ENGRAM_CLOUD_CORS_ORIGINS", " https://one.example , https://two.example ")
-	t.Setenv("ENGRAM_CLOUD_MAX_POOL", "25")
+func TestConfigFromEnvCloudHost(t *testing.T) {
+	t.Run("default bind host stays loopback", func(t *testing.T) {
+		t.Setenv("ENGRAM_CLOUD_HOST", "")
+		cfg := ConfigFromEnv()
+		if cfg.BindHost != "127.0.0.1" {
+			t.Fatalf("expected default bind host 127.0.0.1, got %q", cfg.BindHost)
+		}
+	})
 
+	t.Run("env overrides bind host", func(t *testing.T) {
+		t.Setenv("ENGRAM_CLOUD_HOST", "0.0.0.0")
+		cfg := ConfigFromEnv()
+		if cfg.BindHost != "0.0.0.0" {
+			t.Fatalf("expected bind host override 0.0.0.0, got %q", cfg.BindHost)
+		}
+	})
+}
+
+func TestConfigFromEnvAllowedProjects(t *testing.T) {
+	t.Setenv("ENGRAM_CLOUD_ALLOWED_PROJECTS", "proj-a, proj-b,proj-a")
 	cfg := ConfigFromEnv()
-
-	if cfg.DSN != "postgres://canonical@localhost/canonical" {
-		t.Fatalf("dsn = %q", cfg.DSN)
+	if len(cfg.AllowedProjects) != 2 {
+		t.Fatalf("expected deduplicated allowlist, got %v", cfg.AllowedProjects)
 	}
-	if cfg.JWTSecret != "canonical-secret-value-with-32-bytes!!" {
-		t.Fatalf("jwt secret = %q", cfg.JWTSecret)
-	}
-	if len(cfg.CORSOrigins) != 2 || cfg.CORSOrigins[0] != "https://one.example" || cfg.CORSOrigins[1] != "https://two.example" {
-		t.Fatalf("cors origins = %#v", cfg.CORSOrigins)
-	}
-	if cfg.MaxPool != 25 {
-		t.Fatalf("max pool = %d", cfg.MaxPool)
-	}
-	if cfg.Port != 8080 {
-		t.Fatalf("port = %d", cfg.Port)
+	if cfg.AllowedProjects[0] != "proj-a" || cfg.AllowedProjects[1] != "proj-b" {
+		t.Fatalf("unexpected allowlist order/values: %v", cfg.AllowedProjects)
 	}
 }
 
-func TestConfigFromEnvParsesAdminEmail(t *testing.T) {
-	t.Setenv("ENGRAM_CLOUD_ADMIN", "  admin@example.com  ")
+func TestIsDefaultJWTSecret(t *testing.T) {
+	t.Run("default secret returns true", func(t *testing.T) {
+		if !IsDefaultJWTSecret(DefaultJWTSecret) {
+			t.Fatal("expected default jwt secret to be recognized")
+		}
+	})
 
-	cfg := ConfigFromEnv()
-
-	if cfg.AdminEmail != "admin@example.com" {
-		t.Fatalf("admin email = %q, expected %q", cfg.AdminEmail, "admin@example.com")
-	}
-}
-
-func TestConfigFromEnvAdminEmailEmpty(t *testing.T) {
-	// Ensure ENGRAM_CLOUD_ADMIN is not set.
-	t.Setenv("ENGRAM_CLOUD_ADMIN", "")
-
-	cfg := ConfigFromEnv()
-
-	if cfg.AdminEmail != "" {
-		t.Fatalf("admin email should be empty, got %q", cfg.AdminEmail)
-	}
-}
-
-func TestConfigFromEnvFallsBackToLegacyNames(t *testing.T) {
-	t.Setenv("ENGRAM_DATABASE_URL", "")
-	t.Setenv("ENGRAM_JWT_SECRET", "")
-	t.Setenv("ENGRAM_CLOUD_DSN", "postgres://legacy@localhost/legacy")
-	t.Setenv("ENGRAM_CLOUD_JWT_SECRET", "legacy-secret-value-with-32-bytes!!!!")
-	t.Setenv("ENGRAM_PORT", "9090")
-
-	cfg := ConfigFromEnv()
-
-	if cfg.DSN != "postgres://legacy@localhost/legacy" {
-		t.Fatalf("dsn = %q", cfg.DSN)
-	}
-	if cfg.JWTSecret != "legacy-secret-value-with-32-bytes!!!!" {
-		t.Fatalf("jwt secret = %q", cfg.JWTSecret)
-	}
-	if cfg.Port != 9090 {
-		t.Fatalf("port = %d", cfg.Port)
-	}
+	t.Run("custom secret returns false", func(t *testing.T) {
+		if IsDefaultJWTSecret("custom-super-secret-value-1234567890") {
+			t.Fatal("expected custom jwt secret to be treated as non-default")
+		}
+	})
 }

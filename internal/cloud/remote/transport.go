@@ -1,61 +1,100 @@
-// Package remote implements the cloud-backed sync transport for Engram.
-//
-// It provides a Transport implementation that communicates with the
-// Engram Cloud server for push/pull sync operations over HTTP.
 package remote
 
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"math/rand"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
+	"github.com/Gentleman-Programming/engram/internal/cloud/chunkcodec"
+	"github.com/Gentleman-Programming/engram/internal/store"
 	engramsync "github.com/Gentleman-Programming/engram/internal/sync"
 )
 
-// ─── RemoteTransport ─────────────────────────────────────────────────────────
-
-// RemoteTransport pushes/pulls chunks over HTTP to an Engram cloud server.
-// It implements sync.Transport.
 type RemoteTransport struct {
-	baseURL    string       // e.g. "https://engram.example.com"
-	token      string       // JWT or API key
-	httpClient *http.Client // configurable for testing
-
-	mu             sync.Mutex
-	refreshToken   string
-	onTokenRefresh func(string) error
+	baseURL    string
+	token      string
+	project    string
+	httpClient *http.Client
 }
 
-// NewRemoteTransport creates a RemoteTransport targeting the given cloud server.
+type HTTPStatusError struct {
+	Operation  string
+	StatusCode int
+	ErrorClass string
+	ErrorCode  string
+	Body       string
+}
 
-func NewRemoteTransport(baseURL, token string) (*RemoteTransport, error) {
-	normalizedURL, err := validateBaseURL(baseURL)
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("cloud: %s: status %d: %s", e.Operation, e.StatusCode, strings.TrimSpace(e.Body))
+}
+
+func (e *HTTPStatusError) IsAuthFailure() bool {
+	return e != nil && e.StatusCode == http.StatusUnauthorized
+}
+
+func (e *HTTPStatusError) IsPolicyFailure() bool {
+	return e != nil && e.StatusCode == http.StatusForbidden
+}
+
+func (e *HTTPStatusError) IsRepairableMigrationFailure() bool {
+	return e != nil && strings.TrimSpace(strings.ToLower(e.ErrorClass)) == "repairable"
+}
+
+func (e *HTTPStatusError) IsRepairable() bool {
+	return e.IsRepairableMigrationFailure()
+}
+
+func newHTTPStatusError(operation string, statusCode int, body []byte) error {
+	errorClass := ""
+	errorCode := ""
+	message := strings.TrimSpace(string(body))
+	var payload struct {
+		ErrorClass string `json:"error_class"`
+		ErrorCode  string `json:"error_code"`
+		Error      string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &payload); err == nil {
+		errorClass = strings.TrimSpace(payload.ErrorClass)
+		errorCode = strings.TrimSpace(payload.ErrorCode)
+		if msg := strings.TrimSpace(payload.Error); msg != "" {
+			message = msg
+		}
+	}
+	return &HTTPStatusError{
+		Operation:  operation,
+		StatusCode: statusCode,
+		ErrorClass: errorClass,
+		ErrorCode:  errorCode,
+		Body:       message,
+	}
+}
+
+func NewRemoteTransport(baseURL, token, project string) (*RemoteTransport, error) {
+	normalized, err := validateBaseURL(baseURL)
 	if err != nil {
 		return nil, err
 	}
-
+	project, _ = store.NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		return nil, fmt.Errorf("cloud: project is required")
+	}
 	return &RemoteTransport{
-		baseURL: normalizedURL,
-		token:   token,
+		baseURL: normalized,
+		token:   strings.TrimSpace(token),
+		project: project,
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
 	}, nil
-}
-
-// SetTokenRefresher configures optional access-token refresh for sync operations.
-func (rt *RemoteTransport) SetTokenRefresher(refreshToken string, onTokenRefresh func(string) error) {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	rt.refreshToken = strings.TrimSpace(refreshToken)
-	rt.onTokenRefresh = onTokenRefresh
 }
 
 func validateBaseURL(raw string) (string, error) {
@@ -63,7 +102,6 @@ func validateBaseURL(raw string) (string, error) {
 	if trimmed == "" {
 		return "", fmt.Errorf("cloud: remote url is required")
 	}
-
 	parsed, err := url.Parse(trimmed)
 	if err != nil {
 		return "", fmt.Errorf("cloud: invalid remote url: %w", err)
@@ -74,307 +112,161 @@ func validateBaseURL(raw string) (string, error) {
 	if parsed.Host == "" {
 		return "", fmt.Errorf("cloud: invalid remote url: host is required")
 	}
-
+	if strings.TrimSpace(parsed.RawQuery) != "" {
+		return "", fmt.Errorf("cloud: invalid remote url: query is not allowed")
+	}
+	if strings.TrimSpace(parsed.Fragment) != "" {
+		return "", fmt.Errorf("cloud: invalid remote url: fragment is not allowed")
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
 	return strings.TrimRight(parsed.String(), "/"), nil
 }
 
-// ─── Transport interface implementation ──────────────────────────────────────
+func (rt *RemoteTransport) endpointURL(query url.Values, parts ...string) (string, error) {
+	endpoint, err := url.JoinPath(rt.baseURL, parts...)
+	if err != nil {
+		return "", fmt.Errorf("cloud: build request url: %w", err)
+	}
+	if len(query) == 0 {
+		return endpoint, nil
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("cloud: build request url: %w", err)
+	}
+	parsed.RawQuery = query.Encode()
+	return parsed.String(), nil
+}
 
-// ReadManifest fetches the chunk manifest from the cloud server.
-// GET /sync/pull returns {"version": 1, "chunks": [...]}.
+func (rt *RemoteTransport) setAuthorization(req *http.Request) {
+	if rt.token == "" {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+rt.token)
+}
+
 func (rt *RemoteTransport) ReadManifest() (*engramsync.Manifest, error) {
-	req, err := http.NewRequest("GET", rt.baseURL+"/sync/pull", nil)
+	reqURL, err := rt.endpointURL(url.Values{"project": []string{rt.project}}, "sync", "pull")
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("cloud: build manifest request: %w", err)
 	}
 	rt.setAuthorization(req)
 
-	resp, err := rt.doWithRetry(req)
+	resp, err := rt.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("cloud: fetch manifest: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, rt.httpError("fetch manifest", resp)
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("cloud: read manifest body: %w", err)
+		body, _ := io.ReadAll(resp.Body)
+		return nil, newHTTPStatusError("fetch manifest", resp.StatusCode, body)
 	}
 
 	var m engramsync.Manifest
-	if err := json.Unmarshal(body, &m); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
 		return nil, fmt.Errorf("cloud: parse manifest: %w", err)
 	}
 	return &m, nil
 }
 
-// WriteManifest is a no-op for remote: the cloud server manages its own manifest.
 func (rt *RemoteTransport) WriteManifest(_ *engramsync.Manifest) error {
 	return nil
 }
 
-// WriteChunk pushes a chunk to the cloud server via POST /sync/push.
-// The data parameter is raw ChunkData JSON; this method wraps it in the
-// push request format the server expects.
 func (rt *RemoteTransport) WriteChunk(chunkID string, data []byte, entry engramsync.ChunkEntry) error {
-	// Parse ChunkData from the raw bytes to build the push request.
-	var chunk chunkData
-	if err := json.Unmarshal(data, &chunk); err != nil {
-		return fmt.Errorf("cloud: parse chunk for push: %w", err)
+	canonicalData, err := chunkcodec.CanonicalizeForProject(data, rt.project)
+	if err != nil {
+		return fmt.Errorf("cloud: canonicalize push chunk: %w", err)
+	}
+	canonicalChunkID := chunkcodec.ChunkID(canonicalData)
+	if strings.TrimSpace(chunkID) != "" && strings.TrimSpace(chunkID) != canonicalChunkID {
+		chunkID = canonicalChunkID
 	}
 
-	pushReq := pushRequest{
-		ChunkID:   chunkID,
-		CreatedBy: entry.CreatedBy,
-		Data:      convertChunkToPushData(&chunk),
-	}
-
-	body, err := json.Marshal(pushReq)
+	body, err := json.Marshal(map[string]any{
+		"chunk_id":          canonicalChunkID,
+		"created_by":        entry.CreatedBy,
+		"client_created_at": strings.TrimSpace(entry.CreatedAt),
+		"project":           rt.project,
+		"data":              json.RawMessage(canonicalData),
+	})
 	if err != nil {
 		return fmt.Errorf("cloud: marshal push request: %w", err)
 	}
-
-	req, err := http.NewRequest("POST", rt.baseURL+"/sync/push", bytes.NewReader(body))
+	pushURL, err := rt.endpointURL(nil, "sync", "push")
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest(http.MethodPost, pushURL, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("cloud: build push request: %w", err)
 	}
-	rt.setAuthorization(req)
 	req.Header.Set("Content-Type", "application/json")
+	rt.setAuthorization(req)
 
-	resp, err := rt.doWithRetry(req)
+	resp, err := rt.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("cloud: push chunk %s: %w", chunkID, err)
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
-		return rt.httpError("push chunk "+chunkID, resp)
+		body, _ := io.ReadAll(resp.Body)
+		return newHTTPStatusError(fmt.Sprintf("push chunk %s", chunkID), resp.StatusCode, body)
 	}
 	return nil
 }
 
-// ReadChunk downloads a specific chunk from the cloud server.
-// GET /sync/pull/{chunk_id} returns the raw stored push body.
-// This method extracts the data field and converts it back to ChunkData JSON.
 func (rt *RemoteTransport) ReadChunk(chunkID string) ([]byte, error) {
-	req, err := http.NewRequest("GET", rt.baseURL+"/sync/pull/"+chunkID, nil)
+	reqURL, err := rt.endpointURL(url.Values{"project": []string{rt.project}}, "sync", "pull", chunkID)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("cloud: build pull request: %w", err)
 	}
 	rt.setAuthorization(req)
-
-	resp, err := rt.doWithRetry(req)
+	resp, err := rt.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("cloud: pull chunk %s: %w", chunkID, err)
 	}
 	defer resp.Body.Close()
-
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, engramsync.ErrChunkNotFound
+	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, rt.httpError("pull chunk "+chunkID, resp)
+		body, _ := io.ReadAll(resp.Body)
+		return nil, newHTTPStatusError(fmt.Sprintf("pull chunk %s", chunkID), resp.StatusCode, body)
 	}
-
-	body, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("cloud: read chunk body: %w", err)
+		return nil, fmt.Errorf("cloud: read chunk %s response: %w", chunkID, err)
 	}
-
-	// The server returns the raw push body. Parse it and extract the data field.
-	var pushResp pushRequest
-	if err := json.Unmarshal(body, &pushResp); err != nil {
-		return nil, fmt.Errorf("cloud: parse pull response: %w", err)
+	if len(data) == 0 {
+		return nil, errors.New("cloud: empty chunk payload")
 	}
-
-	// Convert push data back to ChunkData format for the Syncer.
-	chunkData := convertPushDataToChunk(&pushResp.Data)
-	result, err := json.Marshal(chunkData)
-	if err != nil {
-		return nil, fmt.Errorf("cloud: marshal chunk data: %w", err)
-	}
-	return result, nil
+	return data, nil
 }
 
-// ─── Retry Logic ─────────────────────────────────────────────────────────────
-
-const (
-	maxRetries = 3
-	baseDelay  = 500 * time.Millisecond
-)
-
-// retryable returns true for status codes that should be retried.
-func retryable(statusCode int) bool {
-	return statusCode == 429 || statusCode >= 500
-}
-
-// doWithRetry executes an HTTP request with exponential backoff retry
-// for transient failures (429, 5xx) and network errors.
-// Client errors (400, 401, 403, 404) are NOT retried.
-func (rt *RemoteTransport) doWithRetry(req *http.Request) (*http.Response, error) {
-	var bodyBytes []byte
-	if req.Body != nil {
-		var err error
-		bodyBytes, err = io.ReadAll(req.Body)
-		if err != nil {
-			return nil, fmt.Errorf("read request body: %w", err)
-		}
-		req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-	}
-
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		// Reset body for retries.
-		if bodyBytes != nil {
-			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-		}
-		rt.setAuthorization(req)
-
-		resp, err := rt.httpClient.Do(req)
-		if err != nil {
-			// Network error: retry if we have attempts left.
-			if attempt < maxRetries {
-				sleepWithJitter(attempt)
-				continue
-			}
-			return nil, fmt.Errorf("request failed after %d retries: %w", maxRetries, err)
-		}
-
-		if resp.StatusCode == http.StatusUnauthorized && rt.canRefreshToken() {
-			resp.Body.Close()
-			if err := rt.refreshAccessToken(); err != nil {
-				return nil, fmt.Errorf("refresh access token: %w", err)
-			}
-			if bodyBytes != nil {
-				req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
-			}
-			rt.setAuthorization(req)
-			resp, err = rt.httpClient.Do(req)
-			if err != nil {
-				return nil, fmt.Errorf("request failed after refresh: %w", err)
-			}
-			if resp.StatusCode != http.StatusUnauthorized {
-				return resp, nil
-			}
-		}
-
-		// Success or non-retryable client error: return immediately.
-		if !retryable(resp.StatusCode) {
-			return resp, nil
-		}
-
-		// Server error or rate limit: close body and retry.
-		resp.Body.Close()
-		if attempt < maxRetries {
-			sleepWithJitter(attempt)
-		}
-	}
-	return nil, fmt.Errorf("server error after %d retries", maxRetries)
-}
-
-func (rt *RemoteTransport) setAuthorization(req *http.Request) {
-	req.Header.Set("Authorization", "Bearer "+rt.currentToken())
-}
-
-func (rt *RemoteTransport) currentToken() string {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	return rt.token
-}
-
-func (rt *RemoteTransport) canRefreshToken() bool {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	return rt.refreshToken != ""
-}
-
-func (rt *RemoteTransport) refreshAccessToken() error {
-	rt.mu.Lock()
-	refreshToken := rt.refreshToken
-	onTokenRefresh := rt.onTokenRefresh
-	rt.mu.Unlock()
-
-	body, err := json.Marshal(map[string]string{"refresh_token": refreshToken})
-	if err != nil {
-		return fmt.Errorf("marshal refresh request: %w", err)
-	}
-
-	req, err := http.NewRequest(http.MethodPost, rt.baseURL+"/auth/refresh", bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("build refresh request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := rt.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("refresh request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return rt.httpError("refresh token", resp)
-	}
-
-	var refreshResp struct {
-		AccessToken string `json:"access_token"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&refreshResp); err != nil {
-		return fmt.Errorf("parse refresh response: %w", err)
-	}
-	if strings.TrimSpace(refreshResp.AccessToken) == "" {
-		return fmt.Errorf("refresh response missing access token")
-	}
-
-	rt.mu.Lock()
-	rt.token = refreshResp.AccessToken
-	rt.mu.Unlock()
-
-	if onTokenRefresh != nil {
-		if err := onTokenRefresh(refreshResp.AccessToken); err != nil {
-			return fmt.Errorf("persist refreshed token: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// sleepWithJitter sleeps for baseDelay * 2^attempt plus random jitter.
-func sleepWithJitter(attempt int) {
-	delay := baseDelay * (1 << uint(attempt))
-	jitter := time.Duration(rand.Int63n(int64(delay / 4)))
-	time.Sleep(delay + jitter)
-}
-
-// httpError reads the response body and returns a descriptive error.
-func (rt *RemoteTransport) httpError(action string, resp *http.Response) error {
-	body, _ := io.ReadAll(resp.Body)
-
-	var errResp struct {
-		Error string `json:"error"`
-	}
-	if json.Unmarshal(body, &errResp) == nil && errResp.Error != "" {
-		return fmt.Errorf("cloud: %s: %d %s", action, resp.StatusCode, errResp.Error)
-	}
-	return fmt.Errorf("cloud: %s: %d %s", action, resp.StatusCode, http.StatusText(resp.StatusCode))
-}
-
-// ─── Mutation Push/Pull ──────────────────────────────────────────────────────
-
-// MutationEntry represents a single mutation for push/pull operations.
 type MutationEntry struct {
+	Project   string          `json:"project"`
 	Entity    string          `json:"entity"`
 	EntityKey string          `json:"entity_key"`
 	Op        string          `json:"op"`
 	Payload   json.RawMessage `json:"payload"`
 }
 
-// PushMutationsResult holds the server response for a mutation push.
 type PushMutationsResult struct {
-	Accepted int   `json:"accepted"`
-	LastSeq  int64 `json:"last_seq"`
+	AcceptedSeqs []int64 `json:"accepted_seqs"`
 }
 
-// PullMutationResult represents a single mutation returned by the server.
-type PullMutationResult struct {
+type PulledMutation struct {
 	Seq        int64           `json:"seq"`
 	Entity     string          `json:"entity"`
 	EntityKey  string          `json:"entity_key"`
@@ -383,66 +275,110 @@ type PullMutationResult struct {
 	OccurredAt string          `json:"occurred_at"`
 }
 
-// PullMutationsResult holds the server response for a mutation pull.
 type PullMutationsResponse struct {
-	Mutations []PullMutationResult `json:"mutations"`
-	HasMore   bool                 `json:"has_more"`
+	Mutations []PulledMutation `json:"mutations"`
+	HasMore   bool             `json:"has_more"`
+	LatestSeq int64            `json:"latest_seq"`
 }
 
-// PushMutations sends a batch of mutations to the cloud server.
-// POST /sync/mutations/push
-func (rt *RemoteTransport) PushMutations(mutations []MutationEntry) (*PushMutationsResult, error) {
-	body, err := json.Marshal(map[string]any{"mutations": mutations})
+func (rt *RemoteTransport) PushMutations(_ []MutationEntry) (*PushMutationsResult, error) {
+	return nil, fmt.Errorf("cloud: mutation push is not available in this release")
+}
+
+func (rt *RemoteTransport) PullMutations(_ int64, _ int) (*PullMutationsResponse, error) {
+	return nil, fmt.Errorf("cloud: mutation pull is not available in this release")
+}
+
+// ─── MutationTransport ────────────────────────────────────────────────────────
+
+// MutationTransport handles push/pull of fine-grained mutations to the cloud server.
+// Unlike RemoteTransport (which handles chunk-level sync), this operates on the
+// mutation journal and supports cursor-based pull.
+type MutationTransport struct {
+	baseURL    string
+	token      string
+	httpClient *http.Client
+}
+
+// NewMutationTransport creates a MutationTransport. baseURL must be a valid http/https URL.
+// BW6: Reuses validateBaseURL to reject empty/malformed URLs.
+func NewMutationTransport(baseURL, token string) (*MutationTransport, error) {
+	normalized, err := validateBaseURL(baseURL)
+	if err != nil {
+		return nil, err
+	}
+	return &MutationTransport{
+		baseURL: normalized,
+		token:   strings.TrimSpace(token),
+		httpClient: &http.Client{
+			Timeout: 30 * time.Second,
+		},
+	}, nil
+}
+
+func (mt *MutationTransport) setAuthorization(req *http.Request) {
+	if mt.token != "" {
+		req.Header.Set("Authorization", "Bearer "+mt.token)
+	}
+}
+
+// PushMutations POSTs a batch of mutations to the cloud server.
+// REQ-200: 404 → reason_code=server_unsupported; 401 → IsAuthFailure.
+func (mt *MutationTransport) PushMutations(entries []MutationEntry) ([]int64, error) {
+	body, err := json.Marshal(map[string]any{"entries": entries})
 	if err != nil {
 		return nil, fmt.Errorf("cloud: marshal mutation push: %w", err)
 	}
 
-	req, err := http.NewRequest("POST", rt.baseURL+"/sync/mutations/push", bytes.NewReader(body))
+	reqURL := mt.baseURL + "/sync/mutations/push"
+	req, err := http.NewRequest(http.MethodPost, reqURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("cloud: build mutation push request: %w", err)
 	}
-	rt.setAuthorization(req)
 	req.Header.Set("Content-Type", "application/json")
+	mt.setAuthorization(req)
 
-	resp, err := rt.doWithRetry(req)
+	resp, err := mt.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("cloud: mutation push: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, rt.httpError("mutation push", resp)
+		respBody, _ := io.ReadAll(resp.Body)
+		statusErr := newMutationHTTPStatusError("mutation push", resp.StatusCode, respBody)
+		return nil, statusErr
 	}
 
-	var result PushMutationsResult
+	var result struct {
+		AcceptedSeqs []int64 `json:"accepted_seqs"`
+	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, fmt.Errorf("cloud: decode mutation push response: %w", err)
 	}
-	return &result, nil
+	return result.AcceptedSeqs, nil
 }
 
-// PullMutations fetches mutations from the cloud server since a given sequence.
-// GET /sync/mutations/pull?since_seq=N&limit=M
-func (rt *RemoteTransport) PullMutations(sinceSeq int64, limit int) (*PullMutationsResponse, error) {
-	if limit <= 0 {
-		limit = 100
-	}
-
-	u := fmt.Sprintf("%s/sync/mutations/pull?since_seq=%d&limit=%d", rt.baseURL, sinceSeq, limit)
-	req, err := http.NewRequest("GET", u, nil)
+// PullMutations fetches mutations from the cloud server since the given sequence.
+// REQ-201: 404 → reason_code=server_unsupported; 401 → IsAuthFailure.
+func (mt *MutationTransport) PullMutations(sinceSeq int64, limit int) (*PullMutationsResponse, error) {
+	reqURL := fmt.Sprintf("%s/sync/mutations/pull?since_seq=%d&limit=%d", mt.baseURL, sinceSeq, limit)
+	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("cloud: build mutation pull request: %w", err)
 	}
-	rt.setAuthorization(req)
+	mt.setAuthorization(req)
 
-	resp, err := rt.doWithRetry(req)
+	resp, err := mt.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("cloud: mutation pull: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, rt.httpError("mutation pull", resp)
+		respBody, _ := io.ReadAll(resp.Body)
+		statusErr := newMutationHTTPStatusError("mutation pull", resp.StatusCode, respBody)
+		return nil, statusErr
 	}
 
 	var result PullMutationsResponse
@@ -452,188 +388,34 @@ func (rt *RemoteTransport) PullMutations(sinceSeq int64, limit int) (*PullMutati
 	return &result, nil
 }
 
-// ─── Data Conversion ─────────────────────────────────────────────────────────
-
-// Internal types matching the cloud server's push/pull JSON format.
-// These mirror cloudserver/push_pull.go types.
-
-type pushRequest struct {
-	ChunkID   string   `json:"chunk_id"`
-	CreatedBy string   `json:"created_by"`
-	Data      pushData `json:"data"`
-}
-
-type pushData struct {
-	Sessions     []pushSession     `json:"sessions"`
-	Observations []pushObservation `json:"observations"`
-	Prompts      []pushPrompt      `json:"prompts"`
-}
-
-type pushSession struct {
-	ID        string  `json:"id"`
-	Project   string  `json:"project"`
-	Directory string  `json:"directory"`
-	StartedAt string  `json:"started_at"`
-	EndedAt   *string `json:"ended_at,omitempty"`
-	Summary   *string `json:"summary,omitempty"`
-}
-
-type pushObservation struct {
-	SessionID string `json:"session_id"`
-	Type      string `json:"type"`
-	Title     string `json:"title"`
-	Content   string `json:"content"`
-	ToolName  string `json:"tool_name,omitempty"`
-	Project   string `json:"project,omitempty"`
-	Scope     string `json:"scope,omitempty"`
-	TopicKey  string `json:"topic_key,omitempty"`
-}
-
-type pushPrompt struct {
-	SessionID string `json:"session_id"`
-	Content   string `json:"content"`
-	Project   string `json:"project,omitempty"`
-}
-
-// chunkData mirrors sync.ChunkData but avoids importing store types directly
-// to keep this package decoupled from the SQLite store.
-type chunkData struct {
-	Sessions     []sessionData     `json:"sessions"`
-	Observations []observationData `json:"observations"`
-	Prompts      []promptData      `json:"prompts"`
-}
-
-type sessionData struct {
-	ID        string  `json:"id"`
-	Project   string  `json:"project"`
-	Directory string  `json:"directory"`
-	StartedAt string  `json:"started_at"`
-	EndedAt   *string `json:"ended_at,omitempty"`
-	Summary   *string `json:"summary,omitempty"`
-}
-
-type observationData struct {
-	ID             int64   `json:"id"`
-	SessionID      string  `json:"session_id"`
-	Type           string  `json:"type"`
-	Title          string  `json:"title"`
-	Content        string  `json:"content"`
-	ToolName       *string `json:"tool_name,omitempty"`
-	Project        *string `json:"project,omitempty"`
-	Scope          string  `json:"scope"`
-	TopicKey       *string `json:"topic_key,omitempty"`
-	RevisionCount  int     `json:"revision_count"`
-	DuplicateCount int     `json:"duplicate_count"`
-	LastSeenAt     *string `json:"last_seen_at,omitempty"`
-	CreatedAt      string  `json:"created_at"`
-	UpdatedAt      string  `json:"updated_at"`
-	DeletedAt      *string `json:"deleted_at,omitempty"`
-}
-
-type promptData struct {
-	ID        int64  `json:"id"`
-	SessionID string `json:"session_id"`
-	Content   string `json:"content"`
-	Project   string `json:"project,omitempty"`
-	CreatedAt string `json:"created_at"`
-}
-
-// convertChunkToPushData converts ChunkData format to the push request format.
-func convertChunkToPushData(c *chunkData) pushData {
-	pd := pushData{
-		Sessions:     make([]pushSession, 0, len(c.Sessions)),
-		Observations: make([]pushObservation, 0, len(c.Observations)),
-		Prompts:      make([]pushPrompt, 0, len(c.Prompts)),
+// newMutationHTTPStatusError creates an HTTPStatusError for mutation transport operations.
+// REQ-214: 404 → ErrorCode="server_unsupported".
+func newMutationHTTPStatusError(operation string, statusCode int, body []byte) error {
+	// Try to parse standard error envelope first.
+	var payload struct {
+		ErrorClass string `json:"error_class"`
+		ErrorCode  string `json:"error_code"`
+		Error      string `json:"error"`
+	}
+	message := strings.TrimSpace(string(body))
+	if err := json.Unmarshal(body, &payload); err == nil {
+		if msg := strings.TrimSpace(payload.Error); msg != "" {
+			message = msg
+		}
 	}
 
-	for _, s := range c.Sessions {
-		pd.Sessions = append(pd.Sessions, pushSession{
-			ID:        s.ID,
-			Project:   s.Project,
-			Directory: s.Directory,
-			StartedAt: s.StartedAt,
-			EndedAt:   s.EndedAt,
-			Summary:   s.Summary,
-		})
+	// REQ-214 + BC3: 404 maps to server_unsupported and emits an operator warning.
+	errorCode := strings.TrimSpace(payload.ErrorCode)
+	if statusCode == http.StatusNotFound {
+		errorCode = "server_unsupported"
+		log.Printf("[autosync] cloud mutation endpoint returned 404 (server_unsupported); deploy the new server first before enabling ENGRAM_CLOUD_AUTOSYNC=1")
 	}
 
-	for _, o := range c.Observations {
-		obs := pushObservation{
-			SessionID: o.SessionID,
-			Type:      o.Type,
-			Title:     o.Title,
-			Content:   o.Content,
-			Scope:     o.Scope,
-		}
-		if o.ToolName != nil {
-			obs.ToolName = *o.ToolName
-		}
-		if o.Project != nil {
-			obs.Project = *o.Project
-		}
-		if o.TopicKey != nil {
-			obs.TopicKey = *o.TopicKey
-		}
-		pd.Observations = append(pd.Observations, obs)
+	return &HTTPStatusError{
+		Operation:  operation,
+		StatusCode: statusCode,
+		ErrorClass: strings.TrimSpace(payload.ErrorClass),
+		ErrorCode:  errorCode,
+		Body:       message,
 	}
-
-	for _, p := range c.Prompts {
-		pd.Prompts = append(pd.Prompts, pushPrompt{
-			SessionID: p.SessionID,
-			Content:   p.Content,
-			Project:   p.Project,
-		})
-	}
-
-	return pd
-}
-
-// convertPushDataToChunk converts the push response format back to ChunkData.
-func convertPushDataToChunk(pd *pushData) *chunkData {
-	c := &chunkData{
-		Sessions:     make([]sessionData, 0, len(pd.Sessions)),
-		Observations: make([]observationData, 0, len(pd.Observations)),
-		Prompts:      make([]promptData, 0, len(pd.Prompts)),
-	}
-
-	for _, s := range pd.Sessions {
-		c.Sessions = append(c.Sessions, sessionData{
-			ID:        s.ID,
-			Project:   s.Project,
-			Directory: s.Directory,
-			StartedAt: s.StartedAt,
-			EndedAt:   s.EndedAt,
-			Summary:   s.Summary,
-		})
-	}
-
-	for _, o := range pd.Observations {
-		obs := observationData{
-			SessionID: o.SessionID,
-			Type:      o.Type,
-			Title:     o.Title,
-			Content:   o.Content,
-			Scope:     o.Scope,
-		}
-		if o.ToolName != "" {
-			obs.ToolName = &o.ToolName
-		}
-		if o.Project != "" {
-			obs.Project = &o.Project
-		}
-		if o.TopicKey != "" {
-			obs.TopicKey = &o.TopicKey
-		}
-		c.Observations = append(c.Observations, obs)
-	}
-
-	for _, p := range pd.Prompts {
-		c.Prompts = append(c.Prompts, promptData{
-			SessionID: p.SessionID,
-			Content:   p.Content,
-			Project:   p.Project,
-		})
-	}
-
-	return c
 }

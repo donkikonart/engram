@@ -1,1134 +1,1057 @@
 package cloudstore
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Gentleman-Programming/engram/internal/cloud"
-	_ "github.com/lib/pq"
-	"github.com/ory/dockertest/v3"
-	"github.com/ory/dockertest/v3/docker"
+	"github.com/Gentleman-Programming/engram/internal/cloud/chunkcodec"
+	"github.com/Gentleman-Programming/engram/internal/store"
+	engramsync "github.com/Gentleman-Programming/engram/internal/sync"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// testDSN creates a real Postgres 16-alpine container via dockertest and
-// returns a DSN string pointing to it. The container is purged when the
-// test finishes (via t.Cleanup).
-func testDSN(tb testing.TB) string {
-	tb.Helper()
-
-	// Allow skipping in CI environments without Docker.
-	if os.Getenv("SKIP_DOCKER_TESTS") == "1" {
-		tb.Skip("SKIP_DOCKER_TESTS=1, skipping dockertest-based test")
-	}
-
-	pool, err := dockertest.NewPool("")
-	if err != nil {
-		tb.Fatalf("could not construct dockertest pool: %v", err)
-	}
-	if err := pool.Client.Ping(); err != nil {
-		tb.Fatalf("could not connect to Docker: %v", err)
-	}
-
-	resource, err := pool.RunWithOptions(&dockertest.RunOptions{
-		Repository: "postgres",
-		Tag:        "16-alpine",
-		Env: []string{
-			"POSTGRES_PASSWORD=test",
-			"POSTGRES_DB=engram_test",
-			"POSTGRES_USER=postgres",
-		},
-	}, func(config *docker.HostConfig) {
-		config.AutoRemove = true
-		config.RestartPolicy = docker.RestartPolicy{Name: "no"}
-	})
-	if err != nil {
-		tb.Fatalf("could not start postgres container: %v", err)
-	}
-
-	tb.Cleanup(func() {
-		_ = pool.Purge(resource)
-	})
-
-	dsn := fmt.Sprintf("postgres://postgres:test@localhost:%s/engram_test?sslmode=disable",
-		resource.GetPort("5432/tcp"))
-
-	// Wait for Postgres to be ready.
-	if err := pool.Retry(func() error {
-		db, err := sql.Open("postgres", dsn)
-		if err != nil {
-			return err
-		}
-		defer db.Close()
-		return db.Ping()
-	}); err != nil {
-		tb.Fatalf("could not connect to postgres: %v", err)
-	}
-
-	return dsn
-}
-
-func newTestStore(tb testing.TB) *CloudStore {
-	tb.Helper()
-	dsn := testDSN(tb)
-	cs, err := New(cloud.Config{DSN: dsn, MaxPool: 5})
-	if err != nil {
-		tb.Fatalf("New() failed: %v", err)
-	}
-	tb.Cleanup(func() { cs.Close() })
-	return cs
-}
-
-// ── Schema Idempotency ─────────────────────────────────────────────────────
-
-func TestSchemaIdempotency(t *testing.T) {
-	dsn := testDSN(t)
-	cfg := cloud.Config{DSN: dsn, MaxPool: 5}
-
-	// First init.
-	cs1, err := New(cfg)
-	if err != nil {
-		t.Fatalf("first New() failed: %v", err)
-	}
-	cs1.Close()
-
-	// Second init — must NOT fail (CREATE TABLE IF NOT EXISTS).
-	cs2, err := New(cfg)
-	if err != nil {
-		t.Fatalf("second New() failed (schema not idempotent): %v", err)
-	}
-	cs2.Close()
-}
-
-// ── User CRUD ──────────────────────────────────────────────────────────────
-
-func TestCreateUser(t *testing.T) {
-	cs := newTestStore(t)
-
-	u, err := cs.CreateUser("alice", "alice@example.com", "secret123")
-	if err != nil {
-		t.Fatalf("CreateUser: %v", err)
-	}
-	if u.Username != "alice" {
-		t.Errorf("username = %q, want alice", u.Username)
-	}
-	if u.Email != "alice@example.com" {
-		t.Errorf("email = %q, want alice@example.com", u.Email)
-	}
-	if u.ID == "" {
-		t.Error("user ID should not be empty")
-	}
-}
-
-func TestCreateUserDuplicateUsername(t *testing.T) {
-	cs := newTestStore(t)
-
-	_, err := cs.CreateUser("alice", "alice@example.com", "secret123")
-	if err != nil {
-		t.Fatalf("first CreateUser: %v", err)
-	}
-
-	_, err = cs.CreateUser("alice", "different@example.com", "secret456")
+func TestNewRequiresDSN(t *testing.T) {
+	_, err := New(cloud.Config{})
 	if err == nil {
-		t.Fatal("expected error for duplicate username, got nil")
+		t.Fatal("expected error when DSN is empty")
 	}
 }
 
-func TestCreateUserDuplicateEmail(t *testing.T) {
-	cs := newTestStore(t)
-
-	_, err := cs.CreateUser("alice", "shared@example.com", "secret123")
-	if err != nil {
-		t.Fatalf("first CreateUser: %v", err)
+func TestSummarizeChunkCountsEntities(t *testing.T) {
+	counts := summarizeChunk([]byte(`{"sessions":[{"id":"s1"}],"observations":[{"id":1},{"id":2}],"prompts":[{"id":3}]}`))
+	if counts.sessions != 1 || counts.observations != 2 || counts.prompts != 1 {
+		t.Fatalf("unexpected counts: %+v", counts)
 	}
 
-	_, err = cs.CreateUser("bob", "shared@example.com", "secret456")
-	if err == nil {
-		t.Fatal("expected error for duplicate email, got nil")
+	empty := summarizeChunk([]byte(`{`))
+	if empty.sessions != 0 || empty.observations != 0 || empty.prompts != 0 {
+		t.Fatalf("invalid json must return zero counts, got %+v", empty)
 	}
 }
 
-func TestGetUserByUsername(t *testing.T) {
-	cs := newTestStore(t)
-
-	created, err := cs.CreateUser("alice", "alice@example.com", "secret123")
-	if err != nil {
-		t.Fatalf("CreateUser: %v", err)
-	}
-
-	found, err := cs.GetUserByUsername("alice")
-	if err != nil {
-		t.Fatalf("GetUserByUsername: %v", err)
-	}
-	if found.ID != created.ID {
-		t.Errorf("found.ID = %q, want %q", found.ID, created.ID)
+func TestChunkIDFromPayloadStable(t *testing.T) {
+	payload := []byte(`{"sessions":[{"id":"s1"}],"observations":[],"prompts":[]}`)
+	if got := chunkIDFromPayload(payload); got == "" || len(got) != 8 {
+		t.Fatalf("expected 8-char chunk id, got %q", got)
 	}
 }
 
-func TestGetUserByUsernameNotFound(t *testing.T) {
-	cs := newTestStore(t)
-
-	_, err := cs.GetUserByUsername("nonexistent")
-	if err == nil {
-		t.Fatal("expected error for nonexistent user")
+func TestMigrateAcceptsModernCloudChunksWithoutLegacyColumns(t *testing.T) {
+	dsn := os.Getenv("CLOUDSTORE_TEST_DSN")
+	if dsn == "" {
+		t.Skip("CLOUDSTORE_TEST_DSN not set — skipping integration test (requires Postgres)")
 	}
+	if !strings.HasPrefix(dsn, "postgres://") && !strings.HasPrefix(dsn, "postgresql://") {
+		t.Skip("test requires URL-style CLOUDSTORE_TEST_DSN so a per-test search_path can be attached")
+	}
+
+	schema := fmt.Sprintf("cloudstore_modern_%d", time.Now().UnixNano())
+	adminDB, err := sql.Open("pgx", dsn)
+	if err != nil {
+		t.Fatalf("open admin db: %v", err)
+	}
+	defer adminDB.Close()
+	if _, err := adminDB.ExecContext(context.Background(), `CREATE SCHEMA `+schema); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	t.Cleanup(func() { _, _ = adminDB.ExecContext(context.Background(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`) })
+
+	testDSN := dsn + "?search_path=" + schema
+	if strings.Contains(dsn, "?") {
+		testDSN = dsn + "&search_path=" + schema
+	}
+	db, err := sql.Open("pgx", testDSN)
+	if err != nil {
+		t.Fatalf("open schema db: %v", err)
+	}
+	if _, err := db.ExecContext(context.Background(), `CREATE TABLE cloud_chunks (
+		project_name TEXT NOT NULL DEFAULT 'default',
+		chunk_id TEXT NOT NULL,
+		created_by TEXT NOT NULL,
+		client_created_at TIMESTAMPTZ,
+		created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+		payload JSONB NOT NULL,
+		sessions_count INTEGER NOT NULL DEFAULT 0,
+		observations_count INTEGER NOT NULL DEFAULT 0,
+		prompts_count INTEGER NOT NULL DEFAULT 0
+	)`); err != nil {
+		db.Close()
+		t.Fatalf("create modern cloud_chunks: %v", err)
+	}
+	db.Close()
+
+	cs, err := New(cloud.Config{DSN: testDSN})
+	if err != nil {
+		t.Fatalf("New should migrate modern cloud_chunks without imported_at/sessions/memories/prompts: %v", err)
+	}
+	cs.Close()
 }
 
-func TestGetUserByAPIKeyHash(t *testing.T) {
-	cs := newTestStore(t)
+func TestMaterializedMutationBatchChunkIncludesObservationAlongsidePromptAndSession(t *testing.T) {
+	obsPayload := json.RawMessage(`{
+		"sync_id":"obs-04081be99000bdf5",
+		"session_id":"sess-newer",
+		"type":"decision",
+		"title":"newer observation",
+		"content":"must be present in cloud_chunks",
+		"project":"sias-app",
+		"scope":"project",
+		"created_at":"2026-05-04T01:49:52Z"
+	}`)
+	promptPayload := json.RawMessage(`{"sync_id":"prompt-newer","session_id":"sess-newer","content":"newer prompt","project":"sias-app","created_at":"2026-05-04T01:50:00Z"}`)
+	sessionPayload := json.RawMessage(`{"id":"sess-newer","project":"sias-app","directory":"/work/sias-app","started_at":"2026-05-04T01:45:00Z"}`)
 
-	u, err := cs.CreateUser("alice", "alice@example.com", "secret123")
-	if err != nil {
-		t.Fatalf("CreateUser: %v", err)
-	}
-
-	// Set an API key hash directly for testing.
-	_, err = cs.db.Exec(`UPDATE cloud_users SET api_key_hash = $1 WHERE id = $2`, "testhash123", u.ID)
-	if err != nil {
-		t.Fatalf("set api key hash: %v", err)
-	}
-
-	found, err := cs.GetUserByAPIKeyHash("testhash123")
-	if err != nil {
-		t.Fatalf("GetUserByAPIKeyHash: %v", err)
-	}
-	if found.ID != u.ID {
-		t.Errorf("found.ID = %q, want %q", found.ID, u.ID)
-	}
-}
-
-// ── Session Lifecycle ──────────────────────────────────────────────────────
-
-func TestSessionLifecycle(t *testing.T) {
-	cs := newTestStore(t)
-
-	u, err := cs.CreateUser("alice", "alice@example.com", "secret123")
-	if err != nil {
-		t.Fatalf("CreateUser: %v", err)
-	}
-
-	// Create session.
-	if err := cs.CreateSession(u.ID, "sess-1", "myproject", "/tmp"); err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-
-	// Verify it shows up in recent.
-	sessions, err := cs.RecentSessions(u.ID, "", 10)
-	if err != nil {
-		t.Fatalf("RecentSessions: %v", err)
-	}
-	if len(sessions) != 1 {
-		t.Fatalf("expected 1 session, got %d", len(sessions))
-	}
-	if sessions[0].ID != "sess-1" {
-		t.Errorf("session ID = %q, want sess-1", sessions[0].ID)
-	}
-	if sessions[0].Project != "myproject" {
-		t.Errorf("session project = %q, want myproject", sessions[0].Project)
-	}
-
-	// End session.
-	if err := cs.EndSession(u.ID, "sess-1", "done working"); err != nil {
-		t.Fatalf("EndSession: %v", err)
-	}
-
-	// Verify summary.
-	sessions, err = cs.RecentSessions(u.ID, "", 10)
-	if err != nil {
-		t.Fatalf("RecentSessions after end: %v", err)
-	}
-	if len(sessions) != 1 {
-		t.Fatalf("expected 1 session, got %d", len(sessions))
-	}
-	if sessions[0].Summary == nil || *sessions[0].Summary != "done working" {
-		t.Errorf("session summary = %v, want 'done working'", sessions[0].Summary)
-	}
-	if sessions[0].EndedAt == nil {
-		t.Error("session ended_at should not be nil after EndSession")
-	}
-}
-
-func TestSessionFilterByProject(t *testing.T) {
-	cs := newTestStore(t)
-
-	u, err := cs.CreateUser("alice", "alice@example.com", "secret123")
-	if err != nil {
-		t.Fatalf("CreateUser: %v", err)
-	}
-
-	cs.CreateSession(u.ID, "s1", "project-a", "/a")
-	cs.CreateSession(u.ID, "s2", "project-b", "/b")
-
-	sessA, err := cs.RecentSessions(u.ID, "project-a", 10)
-	if err != nil {
-		t.Fatalf("RecentSessions project-a: %v", err)
-	}
-	if len(sessA) != 1 {
-		t.Errorf("expected 1 session for project-a, got %d", len(sessA))
-	}
-}
-
-// ── Observation CRUD ───────────────────────────────────────────────────────
-
-func TestObservationCRUD(t *testing.T) {
-	cs := newTestStore(t)
-
-	u, err := cs.CreateUser("alice", "alice@example.com", "secret123")
-	if err != nil {
-		t.Fatalf("CreateUser: %v", err)
-	}
-	cs.CreateSession(u.ID, "sess-1", "proj", "/tmp")
-
-	// Add observation.
-	obsID, err := cs.AddObservation(u.ID, AddCloudObservationParams{
-		SessionID: "sess-1",
-		Type:      "decision",
-		Title:     "Use Postgres",
-		Content:   "Decided to use Postgres for cloud storage.",
-		Project:   "proj",
-		Scope:     "project",
+	payload, counts, err := materializedMutationBatchChunk([]MutationEntry{
+		{Project: "sias-app", Entity: store.SyncEntitySession, EntityKey: "sess-newer", Op: store.SyncOpUpsert, Payload: sessionPayload},
+		{Project: "sias-app", Entity: store.SyncEntityPrompt, EntityKey: "prompt-newer", Op: store.SyncOpUpsert, Payload: promptPayload},
+		{Project: "sias-app", Entity: store.SyncEntityObservation, EntityKey: "obs-04081be99000bdf5", Op: store.SyncOpUpsert, Payload: obsPayload},
 	})
 	if err != nil {
-		t.Fatalf("AddObservation: %v", err)
+		t.Fatalf("materializedMutationBatchChunk: %v", err)
 	}
-	if obsID == 0 {
-		t.Error("observation ID should not be 0")
-	}
-
-	// Get observation.
-	obs, err := cs.GetObservation(u.ID, obsID)
-	if err != nil {
-		t.Fatalf("GetObservation: %v", err)
-	}
-	if obs.Title != "Use Postgres" {
-		t.Errorf("title = %q, want 'Use Postgres'", obs.Title)
-	}
-	if obs.Type != "decision" {
-		t.Errorf("type = %q, want 'decision'", obs.Type)
+	if counts.sessions != 1 || counts.prompts != 1 || counts.observations != 1 {
+		t.Fatalf("expected one session, prompt, and observation in chunk counts, got %+v", counts)
 	}
 
-	// Recent observations.
-	recent, err := cs.RecentObservations(u.ID, "proj", "", 10)
-	if err != nil {
-		t.Fatalf("RecentObservations: %v", err)
+	var chunk engramsync.ChunkData
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		t.Fatalf("decode materialized chunk: %v", err)
 	}
-	if len(recent) != 1 {
-		t.Fatalf("expected 1 observation, got %d", len(recent))
+	if len(chunk.Prompts) != 1 || len(chunk.Sessions) != 1 {
+		t.Fatalf("expected prompt/session materialized, got sessions=%d prompts=%d", len(chunk.Sessions), len(chunk.Prompts))
 	}
-	if recent[0].ID != obsID {
-		t.Errorf("recent[0].ID = %d, want %d", recent[0].ID, obsID)
+	if len(chunk.Observations) != 1 {
+		t.Fatalf("expected newer observation mutation to be materialized into payload.observations, got %d", len(chunk.Observations))
+	}
+	if chunk.Observations[0].SyncID != "obs-04081be99000bdf5" {
+		t.Fatalf("expected missing observation sync_id to be present, got %q", chunk.Observations[0].SyncID)
+	}
+	if len(chunk.Mutations) != 3 {
+		t.Fatalf("expected mutation journal payloads retained for replay, got %d", len(chunk.Mutations))
 	}
 }
 
-func TestObservationSoftDelete(t *testing.T) {
-	cs := newTestStore(t)
-
-	u, err := cs.CreateUser("alice", "alice@example.com", "secret123")
-	if err != nil {
-		t.Fatalf("CreateUser: %v", err)
-	}
-	cs.CreateSession(u.ID, "sess-1", "proj", "/tmp")
-
-	obsID, err := cs.AddObservation(u.ID, AddCloudObservationParams{
-		SessionID: "sess-1",
-		Type:      "note",
-		Title:     "Temporary",
-		Content:   "This will be deleted.",
-		Project:   "proj",
+func TestMaterializedMutationBatchChunksKeepProjectsSeparate(t *testing.T) {
+	chunks, err := materializedMutationBatchChunks([]MutationEntry{
+		{Project: "proj-a", Entity: store.SyncEntityPrompt, EntityKey: "prompt-a", Op: store.SyncOpUpsert, Payload: json.RawMessage(`{"sync_id":"prompt-a","session_id":"sess-a","content":"a"}`)},
+		{Project: "proj-b", Entity: store.SyncEntityObservation, EntityKey: "obs-b", Op: store.SyncOpUpsert, Payload: json.RawMessage(`{"sync_id":"obs-b","session_id":"sess-b","type":"decision","title":"b","content":"b","scope":"project"}`)},
 	})
 	if err != nil {
-		t.Fatalf("AddObservation: %v", err)
+		t.Fatalf("materializedMutationBatchChunks: %v", err)
 	}
-
-	// Soft delete.
-	if err := cs.DeleteObservation(u.ID, obsID, false); err != nil {
-		t.Fatalf("DeleteObservation (soft): %v", err)
+	if len(chunks) != 2 {
+		t.Fatalf("expected one materialized chunk per project, got %d", len(chunks))
 	}
-
-	// GetObservation should fail (filters deleted_at IS NULL).
-	_, err = cs.GetObservation(u.ID, obsID)
-	if err == nil {
-		t.Fatal("expected error getting soft-deleted observation")
-	}
-
-	// RecentObservations should not include it.
-	recent, err := cs.RecentObservations(u.ID, "", "", 10)
-	if err != nil {
-		t.Fatalf("RecentObservations: %v", err)
-	}
-	if len(recent) != 0 {
-		t.Errorf("expected 0 observations after soft delete, got %d", len(recent))
+	if chunks[0].project != "proj-a" || chunks[1].project != "proj-b" {
+		t.Fatalf("expected project order preserved, got %q then %q", chunks[0].project, chunks[1].project)
 	}
 }
 
-func TestObservationHardDelete(t *testing.T) {
-	cs := newTestStore(t)
-
-	u, err := cs.CreateUser("alice", "alice@example.com", "secret123")
+func TestMutationEntrySignatureMatchesCanonicalChunkMutation(t *testing.T) {
+	entry := MutationEntry{
+		Project:   "proj-signature",
+		Entity:    store.SyncEntityObservation,
+		EntityKey: "obs-signature",
+		Op:        store.SyncOpUpsert,
+		Payload:   json.RawMessage(`{"sync_id":"obs-signature","session_id":"sess-signature","type":"decision","title":"Signature","content":"canonical","scope":"project"}`),
+	}
+	entrySig, err := mutationEntrySignature(entry)
 	if err != nil {
-		t.Fatalf("CreateUser: %v", err)
+		t.Fatalf("mutationEntrySignature: %v", err)
 	}
-	cs.CreateSession(u.ID, "sess-1", "proj", "/tmp")
-
-	obsID, err := cs.AddObservation(u.ID, AddCloudObservationParams{
-		SessionID: "sess-1",
-		Type:      "note",
-		Title:     "Gone forever",
-		Content:   "This will be hard deleted.",
-		Project:   "proj",
-	})
+	payload, _, err := materializedMutationBatchChunk([]MutationEntry{entry})
 	if err != nil {
-		t.Fatalf("AddObservation: %v", err)
+		t.Fatalf("materializedMutationBatchChunk: %v", err)
 	}
-
-	if err := cs.DeleteObservation(u.ID, obsID, true); err != nil {
-		t.Fatalf("DeleteObservation (hard): %v", err)
+	var chunk engramsync.ChunkData
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		t.Fatalf("decode materialized chunk: %v", err)
 	}
-
-	// Verify the row is actually gone from the table.
-	var count int
-	cs.db.QueryRow(`SELECT COUNT(*) FROM cloud_observations WHERE id = $1`, obsID).Scan(&count)
-	if count != 0 {
-		t.Errorf("expected 0 rows after hard delete, got %d", count)
+	if len(chunk.Mutations) != 1 {
+		t.Fatalf("expected one materialized mutation, got %d", len(chunk.Mutations))
+	}
+	chunkSig, err := syncMutationSignature(chunk.Mutations[0])
+	if err != nil {
+		t.Fatalf("syncMutationSignature: %v", err)
+	}
+	if entrySig != chunkSig {
+		t.Fatalf("expected entry signature to match canonical chunk mutation\nentry=%q\nchunk=%q", entrySig, chunkSig)
 	}
 }
 
-// ── Prompt CRUD ────────────────────────────────────────────────────────────
-
-func TestPromptCRUD(t *testing.T) {
-	cs := newTestStore(t)
-
-	u, err := cs.CreateUser("alice", "alice@example.com", "secret123")
-	if err != nil {
-		t.Fatalf("CreateUser: %v", err)
-	}
-	cs.CreateSession(u.ID, "sess-1", "proj", "/tmp")
-
-	// Add prompt.
-	promptID, err := cs.AddPrompt(u.ID, AddCloudPromptParams{
-		SessionID: "sess-1",
-		Content:   "How do I implement auth?",
-		Project:   "proj",
-	})
-	if err != nil {
-		t.Fatalf("AddPrompt: %v", err)
-	}
-	if promptID == 0 {
-		t.Error("prompt ID should not be 0")
-	}
-
-	// Recent prompts.
-	prompts, err := cs.RecentPrompts(u.ID, "proj", 10)
-	if err != nil {
-		t.Fatalf("RecentPrompts: %v", err)
-	}
-	if len(prompts) != 1 {
-		t.Fatalf("expected 1 prompt, got %d", len(prompts))
-	}
-	if prompts[0].Content != "How do I implement auth?" {
-		t.Errorf("prompt content = %q, want 'How do I implement auth?'", prompts[0].Content)
+func TestNormalizeJSONCanonicalizesEquivalentPayloads(t *testing.T) {
+	a := []byte(`{"a":1,"b":[2,3]}`)
+	b := []byte("{\n  \"b\": [2,3], \"a\":1\n}")
+	if string(normalizeJSON(a)) != string(normalizeJSON(b)) {
+		t.Fatalf("expected normalized payloads to match")
 	}
 }
 
-func TestPromptFilterByProject(t *testing.T) {
-	cs := newTestStore(t)
-
-	u, err := cs.CreateUser("alice", "alice@example.com", "secret123")
-	if err != nil {
-		t.Fatalf("CreateUser: %v", err)
+func TestErrorSentinels(t *testing.T) {
+	if !errors.Is(ErrChunkNotFound, ErrChunkNotFound) {
+		t.Fatalf("expected ErrChunkNotFound to be comparable")
 	}
-	cs.CreateSession(u.ID, "sess-1", "proj-a", "/a")
-	cs.CreateSession(u.ID, "sess-2", "proj-b", "/b")
-
-	cs.AddPrompt(u.ID, AddCloudPromptParams{SessionID: "sess-1", Content: "prompt A", Project: "proj-a"})
-	cs.AddPrompt(u.ID, AddCloudPromptParams{SessionID: "sess-2", Content: "prompt B", Project: "proj-b"})
-
-	promptsA, err := cs.RecentPrompts(u.ID, "proj-a", 10)
-	if err != nil {
-		t.Fatalf("RecentPrompts proj-a: %v", err)
+	if !errors.Is(ErrChunkConflict, ErrChunkConflict) {
+		t.Fatalf("expected ErrChunkConflict to be comparable")
 	}
-	if len(promptsA) != 1 {
-		t.Errorf("expected 1 prompt for proj-a, got %d", len(promptsA))
+	if !errors.Is(ErrDashboardProjectInvalid, ErrDashboardProjectInvalid) {
+		t.Fatalf("expected ErrDashboardProjectInvalid to be comparable")
+	}
+	if !errors.Is(ErrDashboardProjectForbidden, ErrDashboardProjectForbidden) {
+		t.Fatalf("expected ErrDashboardProjectForbidden to be comparable")
+	}
+	if !errors.Is(ErrDashboardProjectNotFound, ErrDashboardProjectNotFound) {
+		t.Fatalf("expected ErrDashboardProjectNotFound to be comparable")
 	}
 }
 
-// ── Chunk Idempotency ──────────────────────────────────────────────────────
+func TestDashboardScopedQueriesRejectInvalidOrOutOfScopeProjectBeforeDB(t *testing.T) {
+	cs := &CloudStore{dashboardAllowedScopes: map[string]struct{}{"proj-a": {}}}
 
-func TestChunkIdempotency(t *testing.T) {
-	cs := newTestStore(t)
-
-	u, err := cs.CreateUser("alice", "alice@example.com", "secret123")
-	if err != nil {
-		t.Fatalf("CreateUser: %v", err)
-	}
-
-	data := []byte(`{"test": true}`)
-
-	// First store.
-	if err := cs.StoreChunk(u.ID, "abc12345", "alice", data, 2, 5, 3); err != nil {
-		t.Fatalf("first StoreChunk: %v", err)
-	}
-
-	// Second store with same chunk_id — should NOT error (ON CONFLICT DO NOTHING).
-	if err := cs.StoreChunk(u.ID, "abc12345", "alice", data, 2, 5, 3); err != nil {
-		t.Fatalf("second StoreChunk (idempotency): %v", err)
-	}
-
-	// Verify only one row.
-	chunks, err := cs.ListChunks(u.ID)
-	if err != nil {
-		t.Fatalf("ListChunks: %v", err)
-	}
-	if len(chunks) != 1 {
-		t.Errorf("expected 1 chunk after idempotent store, got %d", len(chunks))
-	}
-}
-
-func TestGetChunk(t *testing.T) {
-	cs := newTestStore(t)
-
-	u, err := cs.CreateUser("alice", "alice@example.com", "secret123")
-	if err != nil {
-		t.Fatalf("CreateUser: %v", err)
-	}
-
-	data := []byte(`{"hello": "world"}`)
-	cs.StoreChunk(u.ID, "chunk1", "alice", data, 1, 2, 0)
-
-	got, err := cs.GetChunk(u.ID, "chunk1")
-	if err != nil {
-		t.Fatalf("GetChunk: %v", err)
-	}
-	if string(got) != string(data) {
-		t.Errorf("chunk data = %q, want %q", got, data)
-	}
-}
-
-func TestSyncedChunks(t *testing.T) {
-	cs := newTestStore(t)
-
-	u, err := cs.CreateUser("alice", "alice@example.com", "secret123")
-	if err != nil {
-		t.Fatalf("CreateUser: %v", err)
-	}
-
-	if err := cs.RecordSyncedChunk(u.ID, "c1"); err != nil {
-		t.Fatalf("RecordSyncedChunk: %v", err)
-	}
-
-	// Idempotent record.
-	if err := cs.RecordSyncedChunk(u.ID, "c1"); err != nil {
-		t.Fatalf("RecordSyncedChunk (idempotent): %v", err)
-	}
-
-	synced, err := cs.GetSyncedChunks(u.ID)
-	if err != nil {
-		t.Fatalf("GetSyncedChunks: %v", err)
-	}
-	if !synced["c1"] {
-		t.Error("expected c1 to be in synced chunks")
-	}
-	if synced["c2"] {
-		t.Error("c2 should not be in synced chunks")
-	}
-}
-
-// ── Data Isolation Between Users ───────────────────────────────────────────
-
-func TestDataIsolation(t *testing.T) {
-	cs := newTestStore(t)
-
-	alice, err := cs.CreateUser("alice", "alice@example.com", "secret123")
-	if err != nil {
-		t.Fatalf("CreateUser alice: %v", err)
-	}
-	bob, err := cs.CreateUser("bob", "bob@example.com", "secret456")
-	if err != nil {
-		t.Fatalf("CreateUser bob: %v", err)
-	}
-
-	// Alice creates a session and observation.
-	cs.CreateSession(alice.ID, "alice-sess", "alice-proj", "/alice")
-	cs.AddObservation(alice.ID, AddCloudObservationParams{
-		SessionID: "alice-sess",
-		Type:      "note",
-		Title:     "Alice's secret",
-		Content:   "This belongs to Alice only.",
-		Project:   "alice-proj",
-	})
-
-	// Bob creates a session and observation.
-	cs.CreateSession(bob.ID, "bob-sess", "bob-proj", "/bob")
-	cs.AddObservation(bob.ID, AddCloudObservationParams{
-		SessionID: "bob-sess",
-		Type:      "note",
-		Title:     "Bob's observation",
-		Content:   "This belongs to Bob only.",
-		Project:   "bob-proj",
-	})
-
-	// Alice should only see her observations.
-	aliceObs, err := cs.RecentObservations(alice.ID, "", "", 10)
-	if err != nil {
-		t.Fatalf("RecentObservations alice: %v", err)
-	}
-	if len(aliceObs) != 1 {
-		t.Errorf("alice should have 1 observation, got %d", len(aliceObs))
-	}
-	if aliceObs[0].Title != "Alice's secret" {
-		t.Errorf("alice obs title = %q, want 'Alice's secret'", aliceObs[0].Title)
-	}
-
-	// Bob should only see his observations.
-	bobObs, err := cs.RecentObservations(bob.ID, "", "", 10)
-	if err != nil {
-		t.Fatalf("RecentObservations bob: %v", err)
-	}
-	if len(bobObs) != 1 {
-		t.Errorf("bob should have 1 observation, got %d", len(bobObs))
-	}
-
-	// Alice should only see her sessions.
-	aliceSess, err := cs.RecentSessions(alice.ID, "", 10)
-	if err != nil {
-		t.Fatalf("RecentSessions alice: %v", err)
-	}
-	if len(aliceSess) != 1 {
-		t.Errorf("alice should have 1 session, got %d", len(aliceSess))
-	}
-
-	// Bob can't read Alice's observation by ID.
-	if len(aliceObs) > 0 {
-		_, err = cs.GetObservation(bob.ID, aliceObs[0].ID)
-		if err == nil {
-			t.Fatal("bob should NOT be able to get alice's observation")
-		}
-	}
-
-	// Alice adds a prompt; Bob should not see it.
-	cs.AddPrompt(alice.ID, AddCloudPromptParams{
-		SessionID: "alice-sess",
-		Content:   "Alice's prompt",
-		Project:   "alice-proj",
-	})
-	bobPrompts, err := cs.RecentPrompts(bob.ID, "", 10)
-	if err != nil {
-		t.Fatalf("RecentPrompts bob: %v", err)
-	}
-	if len(bobPrompts) != 0 {
-		t.Errorf("bob should have 0 prompts, got %d", len(bobPrompts))
-	}
-
-	// Chunk isolation.
-	cs.StoreChunk(alice.ID, "alice-chunk", "alice", []byte("data"), 1, 1, 0)
-	bobChunks, err := cs.ListChunks(bob.ID)
-	if err != nil {
-		t.Fatalf("ListChunks bob: %v", err)
-	}
-	if len(bobChunks) != 0 {
-		t.Errorf("bob should have 0 chunks, got %d", len(bobChunks))
-	}
-}
-
-// ── Stats ──────────────────────────────────────────────────────────────────
-
-func TestStats(t *testing.T) {
-	cs := newTestStore(t)
-
-	u, err := cs.CreateUser("alice", "alice@example.com", "secret123")
-	if err != nil {
-		t.Fatalf("CreateUser: %v", err)
-	}
-
-	// Empty stats.
-	stats, err := cs.Stats(u.ID)
-	if err != nil {
-		t.Fatalf("Stats (empty): %v", err)
-	}
-	if stats.TotalSessions != 0 || stats.TotalObservations != 0 || stats.TotalPrompts != 0 {
-		t.Errorf("empty stats should be all 0, got sessions=%d obs=%d prompts=%d",
-			stats.TotalSessions, stats.TotalObservations, stats.TotalPrompts)
-	}
-
-	// Add some data.
-	cs.CreateSession(u.ID, "s1", "proj", "/tmp")
-	cs.CreateSession(u.ID, "s2", "proj2", "/tmp2")
-	cs.AddObservation(u.ID, AddCloudObservationParams{
-		SessionID: "s1", Type: "note", Title: "T1", Content: "C1", Project: "proj",
-	})
-	cs.AddObservation(u.ID, AddCloudObservationParams{
-		SessionID: "s1", Type: "note", Title: "T2", Content: "C2", Project: "proj",
-	})
-	cs.AddObservation(u.ID, AddCloudObservationParams{
-		SessionID: "s2", Type: "note", Title: "T3", Content: "C3", Project: "proj2",
-	})
-	cs.AddPrompt(u.ID, AddCloudPromptParams{SessionID: "s1", Content: "prompt1", Project: "proj"})
-
-	stats, err = cs.Stats(u.ID)
-	if err != nil {
-		t.Fatalf("Stats: %v", err)
-	}
-	if stats.TotalSessions != 2 {
-		t.Errorf("total sessions = %d, want 2", stats.TotalSessions)
-	}
-	if stats.TotalObservations != 3 {
-		t.Errorf("total observations = %d, want 3", stats.TotalObservations)
-	}
-	if stats.TotalPrompts != 1 {
-		t.Errorf("total prompts = %d, want 1", stats.TotalPrompts)
-	}
-	if len(stats.Projects) != 2 {
-		t.Errorf("projects count = %d, want 2", len(stats.Projects))
-	}
-}
-
-// ── FormatContext ───────────────────────────────────────────────────────────
-
-func TestFormatContext(t *testing.T) {
-	cs := newTestStore(t)
-
-	u, err := cs.CreateUser("alice", "alice@example.com", "secret123")
-	if err != nil {
-		t.Fatalf("CreateUser: %v", err)
-	}
-
-	// Empty context.
-	ctx, err := cs.FormatContext(u.ID, "", "")
-	if err != nil {
-		t.Fatalf("FormatContext (empty): %v", err)
-	}
-	if ctx != "" {
-		t.Errorf("expected empty context, got %q", ctx)
-	}
-
-	// Add data.
-	cs.CreateSession(u.ID, "s1", "proj", "/tmp")
-	cs.AddObservation(u.ID, AddCloudObservationParams{
-		SessionID: "s1", Type: "decision", Title: "Use Postgres", Content: "Decided to use Postgres.", Project: "proj",
-	})
-	cs.AddPrompt(u.ID, AddCloudPromptParams{SessionID: "s1", Content: "How to do auth?", Project: "proj"})
-
-	ctx, err = cs.FormatContext(u.ID, "proj", "")
-	if err != nil {
-		t.Fatalf("FormatContext: %v", err)
-	}
-
-	// Verify format matches local store output structure.
-	if !strings.Contains(ctx, "## Memory from Previous Sessions") {
-		t.Error("context should contain '## Memory from Previous Sessions'")
-	}
-	if !strings.Contains(ctx, "### Recent Sessions") {
-		t.Error("context should contain '### Recent Sessions'")
-	}
-	if !strings.Contains(ctx, "### Recent Observations") {
-		t.Error("context should contain '### Recent Observations'")
-	}
-	if !strings.Contains(ctx, "### Recent User Prompts") {
-		t.Error("context should contain '### Recent User Prompts'")
-	}
-	if !strings.Contains(ctx, "Use Postgres") {
-		t.Error("context should contain observation title")
-	}
-	if !strings.Contains(ctx, "[decision]") {
-		t.Error("context should contain observation type in brackets")
-	}
-}
-
-// ── Session with Observation Count ─────────────────────────────────────────
-
-func TestRecentSessionsWithObservationCount(t *testing.T) {
-	cs := newTestStore(t)
-
-	u, err := cs.CreateUser("alice", "alice@example.com", "secret123")
-	if err != nil {
-		t.Fatalf("CreateUser: %v", err)
-	}
-
-	cs.CreateSession(u.ID, "s1", "proj", "/tmp")
-	cs.AddObservation(u.ID, AddCloudObservationParams{
-		SessionID: "s1", Type: "note", Title: "T1", Content: "C1", Project: "proj",
-	})
-	cs.AddObservation(u.ID, AddCloudObservationParams{
-		SessionID: "s1", Type: "note", Title: "T2", Content: "C2", Project: "proj",
-	})
-
-	sessions, err := cs.RecentSessions(u.ID, "", 10)
-	if err != nil {
-		t.Fatalf("RecentSessions: %v", err)
-	}
-	if len(sessions) != 1 {
-		t.Fatalf("expected 1 session, got %d", len(sessions))
-	}
-	if sessions[0].ObservationCount != 2 {
-		t.Errorf("observation count = %d, want 2", sessions[0].ObservationCount)
-	}
-}
-
-// ── Scope Normalization ────────────────────────────────────────────────────
-
-func TestScopeNormalization(t *testing.T) {
 	tests := []struct {
-		in   string
-		want string
+		name string
+		call func() error
+		want error
 	}{
-		{"", "project"},
-		{"project", "project"},
-		{"PROJECT", "project"},
-		{"personal", "personal"},
-		{"PERSONAL", "personal"},
-		{"global", "global"},
-		{"GLOBAL", "global"},
-		{"custom", "custom"},
+		{
+			name: "project detail rejects blank project",
+			call: func() error {
+				_, err := cs.ProjectDetail("   ")
+				return err
+			},
+			want: ErrDashboardProjectInvalid,
+		},
+		{
+			name: "project detail rejects out of scope project",
+			call: func() error {
+				_, err := cs.ProjectDetail("proj-b")
+				return err
+			},
+			want: ErrDashboardProjectForbidden,
+		},
+		{
+			name: "recent observations rejects out of scope project",
+			call: func() error {
+				_, err := cs.ListRecentObservations("proj-b", "", 10)
+				return err
+			},
+			want: ErrDashboardProjectForbidden,
+		},
+		{
+			name: "recent sessions rejects out of scope project",
+			call: func() error {
+				_, err := cs.ListRecentSessions("proj-b", "", 10)
+				return err
+			},
+			want: ErrDashboardProjectForbidden,
+		},
+		{
+			name: "recent prompts rejects out of scope project",
+			call: func() error {
+				_, err := cs.ListRecentPrompts("proj-b", "", 10)
+				return err
+			},
+			want: ErrDashboardProjectForbidden,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.call()
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("expected error %v, got %v", tt.want, err)
+			}
+		})
+	}
+}
+
+func TestIsUniqueViolation(t *testing.T) {
+	if !isUniqueViolation(&pgconn.PgError{Code: "23505"}) {
+		t.Fatal("expected Postgres unique violation to be detected")
+	}
+	if isUniqueViolation(errors.New("boom")) {
+		t.Fatal("expected non-pg error to return false")
+	}
+}
+
+func TestCollectSessionIDsIncludesChunkSessionsAndMutationSessions(t *testing.T) {
+	sessionIDs := collectSessionIDsFromPayload([]byte(`{
+		"sessions":[{"id":"s-1"}],
+		"mutations":[
+			{"entity":"session","op":"upsert","payload":"{\"id\":\"s-2\",\"directory\":\"/tmp/s-2\"}"},
+			{"entity":"session","op":"upsert","payload":"\"{\\\"id\\\":\\\"s-3\\\",\\\"directory\\\":\\\"/tmp/s-3\\\"}\""},
+			{"entity":"observation","op":"upsert","payload":"{\"session_id\":\"s-1\"}"}
+		]
+	}`))
+
+	if _, ok := sessionIDs["s-1"]; !ok {
+		t.Fatalf("expected session id from chunk sessions")
+	}
+	if _, ok := sessionIDs["s-2"]; !ok {
+		t.Fatalf("expected session id from mutation payload")
+	}
+	if _, ok := sessionIDs["s-3"]; !ok {
+		t.Fatalf("expected session id from double-encoded mutation payload")
+	}
+}
+
+func TestParseClientCreatedAt(t *testing.T) {
+	t.Run("empty is allowed", func(t *testing.T) {
+		got, err := parseClientCreatedAt("")
+		if err != nil {
+			t.Fatalf("expected nil error, got %v", err)
+		}
+		if got != nil {
+			t.Fatalf("expected nil timestamp for empty input, got %v", got)
+		}
+	})
+
+	t.Run("valid RFC3339", func(t *testing.T) {
+		got, err := parseClientCreatedAt("2026-04-01T12:30:00Z")
+		if err != nil {
+			t.Fatalf("expected valid parse, got %v", err)
+		}
+		if got == nil || got.Format(time.RFC3339) != "2026-04-01T12:30:00Z" {
+			t.Fatalf("unexpected timestamp parse result: %v", got)
+		}
+	})
+
+	t.Run("invalid format returns error", func(t *testing.T) {
+		if _, err := parseClientCreatedAt("not-a-time"); err == nil {
+			t.Fatal("expected parse error for invalid timestamp")
+		}
+	})
+}
+
+func TestSortManifestRowsByServerCreatedAtForReplay(t *testing.T) {
+	rows := []manifestRow{
+		{
+			chunkID:       "chunk-newer-client-time",
+			createdBy:     "dev-a",
+			manifestTime:  time.Date(2026, 4, 8, 10, 0, 0, 0, time.UTC),
+			serverCreated: time.Date(2026, 4, 10, 10, 0, 0, 0, time.UTC),
+		},
+		{
+			chunkID:       "chunk-older-client-time",
+			createdBy:     "dev-b",
+			manifestTime:  time.Date(2026, 4, 9, 10, 0, 0, 0, time.UTC),
+			serverCreated: time.Date(2026, 4, 10, 9, 0, 0, 0, time.UTC),
+		},
+	}
+
+	entries := toManifestEntries(rows)
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+	gotOrder := []string{entries[0].ID, entries[1].ID}
+	wantOrder := []string{"chunk-older-client-time", "chunk-newer-client-time"}
+	if !slices.Equal(gotOrder, wantOrder) {
+		t.Fatalf("expected server-created ordering %v, got %v", wantOrder, gotOrder)
+	}
+
+	if entries[0].CreatedAt != "2026-04-09T10:00:00Z" || entries[1].CreatedAt != "2026-04-08T10:00:00Z" {
+		t.Fatalf("expected manifest created_at to preserve metadata timestamps, got %+v", entries)
+	}
+}
+
+func TestSortManifestRowsBreaksServerTimeTiesByChunkID(t *testing.T) {
+	serverTimestamp := time.Date(2026, 4, 10, 10, 0, 0, 0, time.UTC)
+	rows := []manifestRow{
+		{chunkID: "b", createdBy: "dev", manifestTime: serverTimestamp, serverCreated: serverTimestamp},
+		{chunkID: "a", createdBy: "dev", manifestTime: serverTimestamp, serverCreated: serverTimestamp},
+	}
+	entries := toManifestEntries(rows)
+	gotOrder := []string{entries[0].ID, entries[1].ID}
+	wantOrder := []string{"a", "b"}
+	if !slices.Equal(gotOrder, wantOrder) {
+		t.Fatalf("expected deterministic chunk-id tie-break ordering %v, got %v", wantOrder, gotOrder)
+	}
+}
+
+func TestMaterializedChunkMutationsBuildsOrderedUpserts(t *testing.T) {
+	project := "proj-materialize"
+	chunk := parseMustChunk(t, []byte(`{
+		"sessions":[{"id":"s-1","project":"proj-materialize","directory":"/tmp/s-1","started_at":"2026-04-29T10:00:00Z"}],
+		"observations":[{"sync_id":"obs-1","session_id":"s-1","project":"proj-materialize","type":"decision","title":"Decision","content":"Content","scope":"project","created_at":"2026-04-29T10:01:00Z","updated_at":"2026-04-29T10:01:00Z"}],
+		"prompts":[{"sync_id":"prompt-1","session_id":"s-1","project":"proj-materialize","content":"Prompt","created_at":"2026-04-29T10:02:00Z"}]
+	}`))
+
+	entries, err := materializedChunkMutations(project, chunk)
+	if err != nil {
+		t.Fatalf("materializedChunkMutations: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(entries))
+	}
+
+	want := []struct {
+		entity string
+		key    string
+	}{
+		{store.SyncEntitySession, "s-1"},
+		{store.SyncEntityObservation, "obs-1"},
+		{store.SyncEntityPrompt, "prompt-1"},
+	}
+	for i, entry := range entries {
+		if entry.Project != project || entry.Entity != want[i].entity || entry.EntityKey != want[i].key || entry.Op != store.SyncOpUpsert {
+			t.Fatalf("entry %d mismatch: %+v", i, entry)
+		}
+		var payload map[string]any
+		if err := json.Unmarshal(entry.Payload, &payload); err != nil {
+			t.Fatalf("entry %d payload is not object JSON: %v", i, err)
+		}
+		if payload["project"] != project {
+			t.Fatalf("entry %d payload project mismatch: %v", i, payload["project"])
+		}
+	}
+}
+
+func TestMaterializedChunkMutationsRejectsMissingSyncIDs(t *testing.T) {
+	tests := []struct {
+		name  string
+		chunk engramsync.ChunkData
+		want  string
+	}{
+		{
+			name:  "observation missing sync id",
+			chunk: engramsync.ChunkData{Observations: []store.Observation{{SessionID: "s-1"}}},
+			want:  "observations[0].sync_id is required",
+		},
+		{
+			name:  "prompt missing sync id",
+			chunk: engramsync.ChunkData{Prompts: []store.Prompt{{SessionID: "s-1"}}},
+			want:  "prompts[0].sync_id is required",
+		},
 	}
 	for _, tt := range tests {
-		got := normalizeScope(tt.in)
-		if got != tt.want {
-			t.Errorf("normalizeScope(%q) = %q, want %q", tt.in, got, tt.want)
-		}
-	}
-}
-
-// ── Truncate ───────────────────────────────────────────────────────────────
-
-func TestTruncate(t *testing.T) {
-	if got := truncate("hello", 10); got != "hello" {
-		t.Errorf("truncate short = %q, want 'hello'", got)
-	}
-	if got := truncate("hello world", 5); got != "hello..." {
-		t.Errorf("truncate long = %q, want 'hello...'", got)
-	}
-	// Unicode safety.
-	if got := truncate("こんにちは世界", 3); got != "こんに..." {
-		t.Errorf("truncate unicode = %q, want 'こんに...'", got)
-	}
-}
-
-// ── Mutation Ledger ───────────────────────────────────────────────────────
-
-func TestAppendMutationSingleAndPull(t *testing.T) {
-	cs, userID := testStoreAndUser(t)
-
-	payload := json.RawMessage(`{"id":"s1","project":"engram","directory":"/work"}`)
-	seq, err := cs.AppendMutation(userID, "session", "s1", "upsert", payload)
-	if err != nil {
-		t.Fatalf("AppendMutation: %v", err)
-	}
-	if seq <= 0 {
-		t.Fatalf("expected positive seq, got %d", seq)
-	}
-
-	result, err := cs.PullMutations(userID, 0, 10)
-	if err != nil {
-		t.Fatalf("PullMutations: %v", err)
-	}
-	if len(result.Mutations) != 1 {
-		t.Fatalf("expected 1 mutation, got %d", len(result.Mutations))
-	}
-	if result.Mutations[0].Seq != seq {
-		t.Fatalf("seq mismatch: got %d want %d", result.Mutations[0].Seq, seq)
-	}
-	if result.Mutations[0].Entity != "session" {
-		t.Fatalf("entity: got %q", result.Mutations[0].Entity)
-	}
-	if result.Mutations[0].Op != "upsert" {
-		t.Fatalf("op: got %q", result.Mutations[0].Op)
-	}
-	if result.HasMore {
-		t.Fatal("expected has_more=false")
-	}
-}
-
-func TestAppendMutationBatchAndPullCursor(t *testing.T) {
-	cs, userID := testStoreAndUser(t)
-
-	entries := []PushMutationEntry{
-		{Entity: "session", EntityKey: "s1", Op: "upsert", Payload: json.RawMessage(`{"id":"s1","project":"p","directory":"/d"}`)},
-		{Entity: "observation", EntityKey: "obs-a", Op: "upsert", Payload: json.RawMessage(`{"sync_id":"obs-a","session_id":"s1","type":"note","title":"t","content":"c","scope":"project"}`)},
-		{Entity: "prompt", EntityKey: "pr-1", Op: "upsert", Payload: json.RawMessage(`{"sync_id":"pr-1","session_id":"s1","content":"hi","project":"p"}`)},
-	}
-
-	result, err := cs.AppendMutationBatch(userID, entries)
-	if err != nil {
-		t.Fatalf("AppendMutationBatch: %v", err)
-	}
-	if result.Accepted != 3 {
-		t.Fatalf("accepted: got %d", result.Accepted)
-	}
-	if result.LastSeq <= 0 {
-		t.Fatalf("expected positive last_seq, got %d", result.LastSeq)
-	}
-
-	// Pull all
-	all, err := cs.PullMutations(userID, 0, 100)
-	if err != nil {
-		t.Fatalf("PullMutations: %v", err)
-	}
-	if len(all.Mutations) != 3 {
-		t.Fatalf("expected 3 mutations, got %d", len(all.Mutations))
-	}
-
-	// Pull since first seq — should return 2
-	sinceFirst, err := cs.PullMutations(userID, all.Mutations[0].Seq, 100)
-	if err != nil {
-		t.Fatalf("PullMutations since: %v", err)
-	}
-	if len(sinceFirst.Mutations) != 2 {
-		t.Fatalf("expected 2 mutations after cursor, got %d", len(sinceFirst.Mutations))
-	}
-
-	// Pull since last — should return 0
-	sinceLast, err := cs.PullMutations(userID, all.Mutations[2].Seq, 100)
-	if err != nil {
-		t.Fatalf("PullMutations since last: %v", err)
-	}
-	if len(sinceLast.Mutations) != 0 {
-		t.Fatalf("expected 0 mutations after last, got %d", len(sinceLast.Mutations))
-	}
-}
-
-func TestPullMutationsHasMorePagination(t *testing.T) {
-	cs, userID := testStoreAndUser(t)
-
-	// Insert 5 mutations
-	for i := 0; i < 5; i++ {
-		payload := json.RawMessage(fmt.Sprintf(`{"id":"s%d","project":"p","directory":"/d"}`, i))
-		_, err := cs.AppendMutation(userID, "session", fmt.Sprintf("s%d", i), "upsert", payload)
-		if err != nil {
-			t.Fatalf("AppendMutation %d: %v", i, err)
-		}
-	}
-
-	// Pull with limit 3 — should get 3 with has_more=true
-	result, err := cs.PullMutations(userID, 0, 3)
-	if err != nil {
-		t.Fatalf("PullMutations: %v", err)
-	}
-	if len(result.Mutations) != 3 {
-		t.Fatalf("expected 3 mutations, got %d", len(result.Mutations))
-	}
-	if !result.HasMore {
-		t.Fatal("expected has_more=true")
-	}
-
-	// Pull remaining from last cursor
-	result2, err := cs.PullMutations(userID, result.Mutations[2].Seq, 3)
-	if err != nil {
-		t.Fatalf("PullMutations page 2: %v", err)
-	}
-	if len(result2.Mutations) != 2 {
-		t.Fatalf("expected 2 mutations, got %d", len(result2.Mutations))
-	}
-	if result2.HasMore {
-		t.Fatal("expected has_more=false on last page")
-	}
-}
-
-func TestAppendMutationBatchEmptyIsNoOp(t *testing.T) {
-	cs, userID := testStoreAndUser(t)
-
-	result, err := cs.AppendMutationBatch(userID, nil)
-	if err != nil {
-		t.Fatalf("AppendMutationBatch empty: %v", err)
-	}
-	if result.Accepted != 0 {
-		t.Fatalf("expected 0 accepted, got %d", result.Accepted)
-	}
-
-	pulled, err := cs.PullMutations(userID, 0, 10)
-	if err != nil {
-		t.Fatalf("PullMutations: %v", err)
-	}
-	if len(pulled.Mutations) != 0 {
-		t.Fatalf("expected 0 mutations, got %d", len(pulled.Mutations))
-	}
-}
-
-func TestProjectSyncControlsPauseBatchAndPull(t *testing.T) {
-	cs, userID := testStoreAndUser(t)
-
-	if err := cs.SetProjectSyncEnabled("engram", false, userID, "Security review"); err != nil {
-		t.Fatalf("SetProjectSyncEnabled: %v", err)
-	}
-
-	controls, err := cs.ListProjectSyncControls()
-	if err != nil {
-		t.Fatalf("ListProjectSyncControls: %v", err)
-	}
-	foundPaused := false
-	for _, control := range controls {
-		if control.Project == "engram" && !control.SyncEnabled {
-			foundPaused = true
-			if control.PausedReason == nil || *control.PausedReason != "Security review" {
-				t.Fatalf("expected paused reason to persist, got %+v", control.PausedReason)
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := materializedChunkMutations("proj-a", tt.chunk)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("expected %q error, got %v", tt.want, err)
 			}
-		}
-	}
-	if !foundPaused {
-		t.Fatal("expected paused project control for engram")
-	}
-
-	_, err = cs.AppendMutationBatch(userID, []PushMutationEntry{{
-		Entity:    "session",
-		EntityKey: "s-paused",
-		Op:        "upsert",
-		Payload:   json.RawMessage(`{"id":"s-paused","project":"engram","directory":"/work"}`),
-	}})
-	if !errors.Is(err, ErrProjectSyncPaused) {
-		t.Fatalf("expected ErrProjectSyncPaused, got %v", err)
-	}
-
-	if _, err := cs.AppendMutation(userID, "session", "s-paused", "upsert", json.RawMessage(`{"id":"s-paused","project":"engram","directory":"/work"}`)); err != nil {
-		t.Fatalf("AppendMutation: %v", err)
-	}
-	if _, err := cs.AppendMutation(userID, "session", "s-open", "upsert", json.RawMessage(`{"id":"s-open","project":"open-proj","directory":"/work"}`)); err != nil {
-		t.Fatalf("AppendMutation open project: %v", err)
-	}
-
-	pulled, err := cs.PullMutations(userID, 0, 10)
-	if err != nil {
-		t.Fatalf("PullMutations: %v", err)
-	}
-	if len(pulled.Mutations) != 1 {
-		t.Fatalf("expected only unpaused mutation, got %d", len(pulled.Mutations))
-	}
-	if pulled.Mutations[0].EntityKey != "s-open" {
-		t.Fatalf("expected s-open mutation, got %s", pulled.Mutations[0].EntityKey)
+		})
 	}
 }
 
-func TestPullMutationsUserIsolation(t *testing.T) {
-	cs, userA := testStoreAndUser(t)
-
-	// Create user B
-	userB, err := cs.CreateUser("mutuser-b", "mutb@test.com", "password123")
+func TestWriteChunkMaterializesMutationsAndIsReplayIdempotent(t *testing.T) {
+	cs := openTestCloudStore(t)
+	project := "test-chunk-materialize-" + strings.ReplaceAll(time.Now().UTC().Format("20060102150405.000000000"), ".", "-")
+	payload, err := chunkcodec.CanonicalizeForProject([]byte(`{
+		"sessions":[{"id":"s-1","directory":"/tmp/s-1","started_at":"2026-04-29T10:00:00Z"}],
+		"observations":[{"sync_id":"obs-1","session_id":"s-1","type":"decision","title":"Decision","content":"Content","scope":"project","created_at":"2026-04-29T10:01:00Z","updated_at":"2026-04-29T10:01:00Z"}],
+		"prompts":[{"sync_id":"prompt-1","session_id":"s-1","content":"Prompt","created_at":"2026-04-29T10:02:00Z"}]
+	}`), project)
 	if err != nil {
-		t.Fatalf("CreateUser B: %v", err)
+		t.Fatalf("canonicalize chunk: %v", err)
+	}
+	chunkID := chunkIDFromPayload(payload)
+
+	if err := cs.WriteChunk(context.Background(), project, chunkID, "tester", "2026-04-29T10:03:00Z", payload); err != nil {
+		t.Fatalf("WriteChunk: %v", err)
+	}
+	stored, err := cs.ReadChunk(context.Background(), project, chunkID)
+	if err != nil {
+		t.Fatalf("ReadChunk: %v", err)
+	}
+	if string(normalizeJSON(stored)) != string(normalizeJSON(payload)) {
+		t.Fatalf("stored chunk payload mismatch")
 	}
 
-	// User A pushes
-	_, err = cs.AppendMutation(userA, "session", "s-a", "upsert", json.RawMessage(`{"id":"s-a","project":"projA","directory":"/a"}`))
+	mutations, _, _, err := cs.ListMutationsSince(context.Background(), 0, 100, []string{project})
 	if err != nil {
-		t.Fatalf("AppendMutation A: %v", err)
+		t.Fatalf("ListMutationsSince: %v", err)
+	}
+	if len(mutations) != 3 {
+		t.Fatalf("expected 3 materialized mutations, got %d: %+v", len(mutations), mutations)
+	}
+	if mutations[0].Entity != store.SyncEntitySession || mutations[1].Entity != store.SyncEntityObservation || mutations[2].Entity != store.SyncEntityPrompt {
+		t.Fatalf("expected session/observation/prompt order, got %+v", mutations)
+	}
+	if mutations[1].EntityKey != "obs-1" || mutations[1].Op != store.SyncOpUpsert || mutations[1].Project != project {
+		t.Fatalf("unexpected observation mutation: %+v", mutations[1])
 	}
 
-	// User B pulls — should get 0
-	result, err := cs.PullMutations(userB.ID, 0, 100)
-	if err != nil {
-		t.Fatalf("PullMutations B: %v", err)
+	if err := cs.WriteChunk(context.Background(), project, chunkID, "tester", "2026-04-29T10:03:00Z", payload); err != nil {
+		t.Fatalf("replay WriteChunk: %v", err)
 	}
-	if len(result.Mutations) != 0 {
-		t.Fatalf("expected 0 mutations for user B, got %d", len(result.Mutations))
+	mutationsAfterReplay, _, _, err := cs.ListMutationsSince(context.Background(), 0, 100, []string{project})
+	if err != nil {
+		t.Fatalf("ListMutationsSince after replay: %v", err)
+	}
+	if len(mutationsAfterReplay) != 3 {
+		t.Fatalf("expected replay not to duplicate mutations, got %d: %+v", len(mutationsAfterReplay), mutationsAfterReplay)
 	}
 }
 
-func TestApplyMutationPayloadSession(t *testing.T) {
-	cs, userID := testStoreAndUser(t)
+func TestBackfillMutationChunksMaterializesExistingMutationRows(t *testing.T) {
+	cs := openTestCloudStore(t)
+	ctx := context.Background()
+	project := uniqueCloudstoreTestProject("mutation-backfill")
+	cleanupCloudstoreProject(t, cs, project)
 
-	payload := json.RawMessage(`{"id":"apply-s1","project":"engram","directory":"/work"}`)
-	err := cs.ApplyMutationPayload(userID, "session", "upsert", payload)
+	insertLegacyCloudMutation(t, cs, project, store.SyncEntitySession, "sess-backfill", store.SyncOpUpsert, `{"id":"sess-backfill","directory":"/work/backfill","started_at":"2026-05-04T01:45:00Z"}`)
+	insertLegacyCloudMutation(t, cs, project, store.SyncEntityObservation, "obs-backfill", store.SyncOpUpsert, `{"sync_id":"obs-backfill","session_id":"sess-backfill","type":"decision","title":"Backfilled observation","content":"must be reconstructed from chunks","scope":"project","created_at":"2026-05-04T01:49:52Z"}`)
+
+	dryRun, err := cs.BackfillMutationChunks(ctx, project, false)
 	if err != nil {
-		t.Fatalf("ApplyMutationPayload session: %v", err)
+		t.Fatalf("BackfillMutationChunks dry-run: %v", err)
+	}
+	if dryRun.Applied || dryRun.CandidateMutations != 2 || dryRun.ChunksPlanned != 1 || dryRun.ChunksInserted != 0 {
+		t.Fatalf("unexpected dry-run report: %+v", dryRun)
+	}
+	if got := countCloudChunksForProject(t, cs, project); got != 0 {
+		t.Fatalf("dry-run must not insert chunks, got %d", got)
 	}
 
-	// Verify the session was materialized
-	sessions, err := cs.RecentSessions(userID, "engram", 10)
+	report, err := cs.BackfillMutationChunks(ctx, project, true)
 	if err != nil {
-		t.Fatalf("RecentSessions: %v", err)
+		t.Fatalf("BackfillMutationChunks apply: %v", err)
 	}
-	found := false
-	for _, s := range sessions {
-		if s.ID == "apply-s1" {
-			found = true
-			break
-		}
+	if !report.Applied || report.CandidateMutations != 2 || report.ChunksPlanned != 1 || report.ChunksInserted != 1 {
+		t.Fatalf("unexpected apply report: %+v", report)
 	}
-	if !found {
-		t.Fatal("session apply-s1 not found after ApplyMutationPayload")
+
+	chunks := readCloudChunksForProject(t, cs, project)
+	if len(chunks) != 1 {
+		t.Fatalf("expected one repair chunk, got %d", len(chunks))
+	}
+	var chunk engramsync.ChunkData
+	if err := json.Unmarshal(chunks[0], &chunk); err != nil {
+		t.Fatalf("decode repair chunk: %v", err)
+	}
+	if len(chunk.Sessions) != 1 || chunk.Sessions[0].ID != "sess-backfill" {
+		t.Fatalf("expected session upsert in repair chunk, got %+v", chunk.Sessions)
+	}
+	if len(chunk.Observations) != 1 || chunk.Observations[0].SyncID != "obs-backfill" {
+		t.Fatalf("expected observation upsert in payload.observations after repair, got %+v", chunk.Observations)
+	}
+	if len(chunk.Mutations) != 2 {
+		t.Fatalf("expected original mutation replay entries retained, got %d", len(chunk.Mutations))
 	}
 }
 
-func TestApplyMutationPayloadSessionAcceptsStringifiedJSON(t *testing.T) {
-	cs, userID := testStoreAndUser(t)
+func TestBackfillMutationChunksIsIdempotent(t *testing.T) {
+	cs := openTestCloudStore(t)
+	ctx := context.Background()
+	project := uniqueCloudstoreTestProject("mutation-backfill-idempotent")
+	cleanupCloudstoreProject(t, cs, project)
 
-	payload := json.RawMessage(`"{\"id\":\"apply-s2\",\"project\":\"engram\",\"directory\":\"/compat\"}"`)
-	err := cs.ApplyMutationPayload(userID, "session", "upsert", payload)
+	insertLegacyCloudMutation(t, cs, project, store.SyncEntityObservation, "obs-idempotent", store.SyncOpUpsert, `{"sync_id":"obs-idempotent","session_id":"sess-idempotent","type":"decision","title":"Idempotent observation","content":"materialize once","scope":"project","created_at":"2026-05-04T01:49:52Z"}`)
+
+	first, err := cs.BackfillMutationChunks(ctx, project, true)
 	if err != nil {
-		t.Fatalf("ApplyMutationPayload stringified session: %v", err)
+		t.Fatalf("first BackfillMutationChunks: %v", err)
 	}
-
-	sessions, err := cs.RecentSessions(userID, "engram", 10)
+	if first.ChunksInserted != 1 {
+		t.Fatalf("expected first repair to insert one chunk, got %+v", first)
+	}
+	second, err := cs.BackfillMutationChunks(ctx, project, true)
 	if err != nil {
-		t.Fatalf("RecentSessions: %v", err)
+		t.Fatalf("second BackfillMutationChunks: %v", err)
 	}
-	for _, s := range sessions {
-		if s.ID == "apply-s2" {
-			return
-		}
+	if second.ChunksPlanned != 0 || second.ChunksInserted != 0 || second.AlreadyMaterialized != 1 {
+		t.Fatalf("expected second repair to be noop, got %+v", second)
 	}
-	t.Fatal("session apply-s2 not found after stringified ApplyMutationPayload")
-}
-
-func TestApplyMutationPayloadObservation(t *testing.T) {
-	cs, userID := testStoreAndUser(t)
-
-	// First create the session so FK is satisfied
-	err := cs.CreateSession(userID, "obs-sess", "engram", "/work")
-	if err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-
-	payload := json.RawMessage(`{"sync_id":"obs-apply-1","session_id":"obs-sess","type":"decision","title":"Apply test","content":"Testing apply","scope":"project"}`)
-	err = cs.ApplyMutationPayload(userID, "observation", "upsert", payload)
-	if err != nil {
-		t.Fatalf("ApplyMutationPayload observation: %v", err)
-	}
-
-	// Verify materialized
-	obs, err := cs.RecentObservations(userID, "", "", 10)
-	if err != nil {
-		t.Fatalf("RecentObservations: %v", err)
-	}
-	found := false
-	for _, o := range obs {
-		if o.Title == "Apply test" {
-			found = true
-			break
-		}
-	}
-	if !found {
-		t.Fatal("observation not found after ApplyMutationPayload")
+	if got := countCloudChunksForProject(t, cs, project); got != 1 {
+		t.Fatalf("expected no duplicate chunks after rerun, got %d", got)
 	}
 }
 
-func TestApplyMutationPayloadUnknownEntity(t *testing.T) {
-	cs, userID := testStoreAndUser(t)
+func TestBackfillMutationChunksSkipsInvalidLegacyMutationPayloads(t *testing.T) {
+	cs := openTestCloudStore(t)
+	ctx := context.Background()
+	project := uniqueCloudstoreTestProject("mutation-backfill-invalid")
+	cleanupCloudstoreProject(t, cs, project)
 
-	err := cs.ApplyMutationPayload(userID, "unknown", "upsert", json.RawMessage(`{}`))
-	if err == nil {
-		t.Fatal("expected error for unknown entity")
+	insertLegacyCloudMutation(t, cs, project, store.SyncEntitySession, "manual-save-engram", store.SyncOpUpsert, `{"id":"manual-save-engram"}`)
+	insertLegacyCloudMutation(t, cs, project, store.SyncEntityObservation, "obs-valid", store.SyncOpUpsert, `{"sync_id":"obs-valid","session_id":"sess-valid","type":"decision","title":"Valid observation","content":"materialize this one","scope":"project","created_at":"2026-05-04T01:49:52Z"}`)
+
+	report, err := cs.BackfillMutationChunks(ctx, project, true)
+	if err != nil {
+		t.Fatalf("BackfillMutationChunks must skip invalid legacy payloads instead of failing: %v", err)
 	}
-	if !strings.Contains(err.Error(), "unknown mutation entity") {
-		t.Fatalf("expected 'unknown mutation entity' error, got: %v", err)
+	if !report.Applied || report.CandidateMutations != 2 || report.InvalidMutations != 1 || report.ChunksPlanned != 1 || report.ChunksInserted != 1 {
+		t.Fatalf("unexpected report for invalid legacy payload skip: %+v", report)
+	}
+	chunks := readCloudChunksForProject(t, cs, project)
+	if len(chunks) != 1 {
+		t.Fatalf("expected valid mutation to still materialize into one chunk, got %d", len(chunks))
+	}
+	var chunk engramsync.ChunkData
+	if err := json.Unmarshal(chunks[0], &chunk); err != nil {
+		t.Fatalf("decode repair chunk: %v", err)
+	}
+	if len(chunk.Sessions) != 0 {
+		t.Fatalf("invalid legacy session without directory must not be materialized, got %+v", chunk.Sessions)
+	}
+	if len(chunk.Observations) != 1 || chunk.Observations[0].SyncID != "obs-valid" {
+		t.Fatalf("expected valid observation to materialize, got %+v", chunk.Observations)
 	}
 }
 
-// testStoreAndUser is a helper that returns a CloudStore and a registered user ID.
-func testStoreAndUser(t *testing.T) (*CloudStore, string) {
+func uniqueCloudstoreTestProject(prefix string) string {
+	return prefix + "-" + strings.ReplaceAll(time.Now().UTC().Format("20060102150405.000000000"), ".", "-")
+}
+
+func cleanupCloudstoreProject(t *testing.T, cs *CloudStore, project string) {
 	t.Helper()
-	dsn := testDSN(t)
-	cs, err := New(cloud.Config{DSN: dsn, MaxPool: 5})
-	if err != nil {
-		t.Fatalf("cloudstore.New: %v", err)
-	}
-	t.Cleanup(func() { cs.Close() })
+	t.Cleanup(func() {
+		_, _ = cs.db.ExecContext(context.Background(), `DELETE FROM cloud_chunks WHERE project_name = $1`, project)
+		_, _ = cs.db.ExecContext(context.Background(), `DELETE FROM cloud_mutations WHERE project = $1`, project)
+		_, _ = cs.db.ExecContext(context.Background(), `DELETE FROM cloud_project_sessions WHERE project_name = $1`, project)
+	})
+}
 
-	user, err := cs.CreateUser("mutuser", "mut@test.com", "password123")
+func insertLegacyCloudMutation(t *testing.T, cs *CloudStore, project, entity, entityKey, op, payload string) {
+	t.Helper()
+	_, err := cs.db.ExecContext(context.Background(), `
+		INSERT INTO cloud_mutations (project, entity, entity_key, op, payload)
+		VALUES ($1, $2, $3, $4, $5)`, project, entity, entityKey, op, []byte(payload))
 	if err != nil {
-		t.Fatalf("CreateUser: %v", err)
+		t.Fatalf("insert legacy cloud mutation %s/%s: %v", entity, entityKey, err)
 	}
-	return cs, user.ID
+}
+
+func countCloudChunksForProject(t *testing.T, cs *CloudStore, project string) int {
+	t.Helper()
+	var count int
+	if err := cs.db.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM cloud_chunks WHERE project_name = $1`, project).Scan(&count); err != nil {
+		t.Fatalf("count cloud chunks: %v", err)
+	}
+	return count
+}
+
+func readCloudChunksForProject(t *testing.T, cs *CloudStore, project string) [][]byte {
+	t.Helper()
+	rows, err := cs.db.QueryContext(context.Background(), `SELECT payload FROM cloud_chunks WHERE project_name = $1 ORDER BY created_at ASC, chunk_id ASC`, project)
+	if err != nil {
+		t.Fatalf("query cloud chunks: %v", err)
+	}
+	defer rows.Close()
+	var chunks [][]byte
+	for rows.Next() {
+		var payload []byte
+		if err := rows.Scan(&payload); err != nil {
+			t.Fatalf("scan cloud chunk: %v", err)
+		}
+		chunks = append(chunks, payload)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate cloud chunks: %v", err)
+	}
+	return chunks
+}
+
+func parseMustChunk(t *testing.T, payload []byte) engramsync.ChunkData {
+	t.Helper()
+	chunk, err := parseChunkData(payload)
+	if err != nil {
+		t.Fatalf("parse chunk data: %v", err)
+	}
+	return chunk
+}
+
+func TestBuildDashboardReadModelSupportsParityQueries(t *testing.T) {
+	chunks := []dashboardChunkRow{
+		{
+			project:   "proj-a",
+			createdBy: "alan@example.com",
+			parsed: parseMustChunk(t, []byte(`{
+				"sessions":[{"id":"s-1","project":"proj-a","started_at":"2026-04-21T08:00:00Z"}],
+				"observations":[{"sync_id":"obs-1","session_id":"s-1","project":"proj-a","type":"decision","title":"Decision A","created_at":"2026-04-21T08:10:00Z"}],
+				"prompts":[{"sync_id":"prompt-1","session_id":"s-1","project":"proj-a","content":"Prompt A","created_at":"2026-04-21T08:20:00Z"}]
+			}`)),
+		},
+		{
+			project:   "proj-a",
+			createdBy: "sofia@example.com",
+			parsed: parseMustChunk(t, []byte(`{
+				"sessions":[{"id":"s-2","project":"proj-a","started_at":"2026-04-22T08:00:00Z"}],
+				"observations":[{"sync_id":"obs-2","session_id":"s-2","project":"proj-a","type":"note","title":"Note B","created_at":"2026-04-22T08:10:00Z"}]
+			}`)),
+		},
+		{
+			project:   "proj-b",
+			createdBy: "alan@example.com",
+			parsed: parseMustChunk(t, []byte(`{
+				"sessions":[{"id":"s-3","project":"proj-b","started_at":"2026-04-23T08:00:00Z"}],
+				"observations":[{"sync_id":"obs-3","session_id":"s-3","project":"proj-b","type":"decision","title":"Decision C","created_at":"2026-04-23T08:10:00Z"}],
+				"prompts":[{"sync_id":"prompt-3","session_id":"s-3","project":"proj-b","content":"Prompt C","created_at":"2026-04-23T08:20:00Z"}]
+			}`)),
+		},
+	}
+
+	model, err := buildDashboardReadModel(chunks)
+	if err != nil {
+		t.Fatalf("build dashboard read model: %v", err)
+	}
+
+	if len(model.projects) != 2 {
+		t.Fatalf("expected project metrics for two projects, got %d", len(model.projects))
+	}
+	if model.admin.Projects != 2 {
+		t.Fatalf("expected admin project count=2, got %+v", model.admin)
+	}
+
+	projDetail, ok := model.projectDetails["proj-a"]
+	if !ok {
+		t.Fatalf("expected project detail for proj-a")
+	}
+	if projDetail.Stats.Sessions != 2 || projDetail.Stats.Observations != 2 {
+		t.Fatalf("expected project detail metrics to be queryable, got %+v", projDetail.Stats)
+	}
+
+	filteredObservations := model.filterObservations("proj-a", "Decision")
+	if len(filteredObservations) != 1 || filteredObservations[0].Title != "Decision A" {
+		t.Fatalf("expected queryable browser observations filter, got %+v", filteredObservations)
+	}
+
+	contributors := model.listContributors("")
+	if len(contributors) != 2 {
+		t.Fatalf("expected contributor rows from chunk history backfill, got %d", len(contributors))
+	}
+}
+
+func TestBuildDashboardReadModelReplaysMutationsInOrder(t *testing.T) {
+	chunks := []dashboardChunkRow{
+		{
+			project:   "proj-replay",
+			createdBy: "alan@example.com",
+			createdAt: time.Date(2026, 4, 23, 10, 0, 0, 0, time.UTC),
+			parsed: parseMustChunk(t, []byte(`{
+				"mutations":[
+					{"entity":"observation","entity_key":"obs-1","op":"delete","payload":"{\"sync_id\":\"obs-1\",\"session_id\":\"s-1\",\"deleted\":true,\"hard_delete\":true}"},
+					{"entity":"prompt","entity_key":"prompt-2","op":"upsert","payload":"{\"sync_id\":\"prompt-2\",\"session_id\":\"s-1\",\"project\":\"proj-replay\",\"content\":\"Prompt persisted\",\"created_at\":\"2026-04-23T09:40:00Z\"}"}
+				]
+			}`)),
+		},
+		{
+			project:   "proj-replay",
+			createdBy: "alan@example.com",
+			createdAt: time.Date(2026, 4, 22, 10, 0, 0, 0, time.UTC),
+			parsed: parseMustChunk(t, []byte(`{
+				"mutations":[
+					{"entity":"session","entity_key":"s-1","op":"upsert","payload":"{\"id\":\"s-1\",\"project\":\"proj-replay\",\"started_at\":\"2026-04-23T09:30:00Z\"}"},
+					{"entity":"observation","entity_key":"obs-1","op":"upsert","payload":"{\"sync_id\":\"obs-1\",\"session_id\":\"s-1\",\"project\":\"proj-replay\",\"type\":\"decision\",\"title\":\"Decision final\",\"created_at\":\"2026-04-23T09:31:00Z\"}"},
+					{"entity":"prompt","entity_key":"prompt-1","op":"delete","payload":"{\"sync_id\":\"prompt-1\",\"session_id\":\"s-1\",\"deleted\":true,\"hard_delete\":true}"}
+				]
+			}`)),
+		},
+		{
+			project:   "proj-replay",
+			createdBy: "alan@example.com",
+			createdAt: time.Date(2026, 4, 21, 10, 0, 0, 0, time.UTC),
+			parsed: parseMustChunk(t, []byte(`{
+				"sessions":[{"id":"s-1","project":"proj-replay","started_at":"2026-04-23T09:00:00Z"}],
+				"observations":[{"sync_id":"obs-1","session_id":"s-1","project":"proj-replay","type":"decision","title":"Decision draft","created_at":"2026-04-23T09:10:00Z"}],
+				"prompts":[{"sync_id":"prompt-1","session_id":"s-1","project":"proj-replay","content":"Prompt removed","created_at":"2026-04-23T09:20:00Z"}]
+			}`)),
+		},
+	}
+
+	model, err := buildDashboardReadModel(chunks)
+	if err != nil {
+		t.Fatalf("build dashboard read model: %v", err)
+	}
+
+	detail := model.projectDetails["proj-replay"]
+	if detail.Stats.Chunks != 3 {
+		t.Fatalf("expected 3 chunks counted for project history, got %d", detail.Stats.Chunks)
+	}
+	if detail.Stats.Sessions != 1 {
+		t.Fatalf("expected final replayed session count=1, got %d", detail.Stats.Sessions)
+	}
+	if detail.Stats.Observations != 0 {
+		t.Fatalf("expected replayed observation delete to remove obs-1, got %d", detail.Stats.Observations)
+	}
+	if detail.Stats.Prompts != 1 {
+		t.Fatalf("expected delete-only + upsert replay to keep one prompt, got %d", detail.Stats.Prompts)
+	}
+	if len(detail.Sessions) != 1 || detail.Sessions[0].StartedAt != "2026-04-23T09:30:00Z" {
+		t.Fatalf("expected repeated session upsert to keep newest value, got %+v", detail.Sessions)
+	}
+	if len(detail.Observations) != 0 {
+		t.Fatalf("expected no observations after delete-only chunk, got %+v", detail.Observations)
+	}
+	if len(detail.Prompts) != 1 || detail.Prompts[0].Content != "Prompt persisted" {
+		t.Fatalf("expected prompt-2 to remain after replay, got %+v", detail.Prompts)
+	}
+
+	if got := model.filterObservations("proj-replay", ""); len(got) != 0 {
+		t.Fatalf("expected browser observations to reflect replay deletes, got %+v", got)
+	}
+	if got := model.filterPrompts("proj-replay", "persisted"); len(got) != 1 || got[0].Content != "Prompt persisted" {
+		t.Fatalf("expected browser prompts query to use replayed current state, got %+v", got)
+	}
+}
+
+func TestBuildDashboardReadModelProjectDetailContributorChunksAreProjectScoped(t *testing.T) {
+	chunks := []dashboardChunkRow{
+		{
+			project:   "proj-a",
+			createdBy: "alan@example.com",
+			createdAt: time.Date(2026, 4, 21, 8, 0, 0, 0, time.UTC),
+			parsed:    engramsync.ChunkData{Mutations: []store.SyncMutation{{Entity: store.SyncEntitySession, EntityKey: "s-a1", Op: store.SyncOpUpsert, Payload: `{"id":"s-a1","project":"proj-a","started_at":"2026-04-21T08:00:00Z"}`}}},
+		},
+		{
+			project:   "proj-a",
+			createdBy: "alan@example.com",
+			createdAt: time.Date(2026, 4, 21, 9, 0, 0, 0, time.UTC),
+			parsed:    engramsync.ChunkData{Mutations: []store.SyncMutation{{Entity: store.SyncEntityObservation, EntityKey: "obs-a", Op: store.SyncOpUpsert, Payload: `{"sync_id":"obs-a","session_id":"s-a1","project":"proj-a","type":"decision","title":"A","created_at":"2026-04-21T09:00:00Z"}`}}},
+		},
+		{
+			project:   "proj-b",
+			createdBy: "alan@example.com",
+			createdAt: time.Date(2026, 4, 22, 8, 0, 0, 0, time.UTC),
+			parsed:    engramsync.ChunkData{Mutations: []store.SyncMutation{{Entity: store.SyncEntitySession, EntityKey: "s-b1", Op: store.SyncOpUpsert, Payload: `{"id":"s-b1","project":"proj-b","started_at":"2026-04-22T08:00:00Z"}`}}},
+		},
+	}
+
+	model, err := buildDashboardReadModel(chunks)
+	if err != nil {
+		t.Fatalf("build dashboard read model: %v", err)
+	}
+	detail, ok := model.projectDetails["proj-a"]
+	if !ok {
+		t.Fatalf("expected detail for proj-a")
+	}
+	if len(detail.Contributors) != 1 {
+		t.Fatalf("expected one contributor for proj-a, got %+v", detail.Contributors)
+	}
+	if detail.Contributors[0].Chunks != 2 {
+		t.Fatalf("expected contributor chunk count scoped to proj-a=2, got %+v", detail.Contributors[0])
+	}
+
+	contributors := model.listContributors("alan")
+	if len(contributors) != 1 || contributors[0].Chunks != 3 {
+		t.Fatalf("expected global contributor list to keep global chunk count=3, got %+v", contributors)
+	}
+}
+
+func TestBuildDashboardReadModelUsesStableChunkIDOrderForEqualTimestamps(t *testing.T) {
+	timestamp := time.Date(2026, 4, 23, 10, 0, 0, 0, time.UTC)
+	base := []dashboardChunkRow{
+		{
+			chunkID:   "b-chunk",
+			project:   "proj-stable",
+			createdBy: "alan@example.com",
+			createdAt: timestamp,
+			parsed:    engramsync.ChunkData{Mutations: []store.SyncMutation{{Entity: store.SyncEntityObservation, EntityKey: "obs-1", Op: store.SyncOpUpsert, Payload: `{"sync_id":"obs-1","session_id":"s-1","project":"proj-stable","type":"decision","title":"newer","created_at":"2026-04-23T10:00:00Z"}`}}},
+		},
+		{
+			chunkID:   "a-chunk",
+			project:   "proj-stable",
+			createdBy: "alan@example.com",
+			createdAt: timestamp,
+			parsed:    engramsync.ChunkData{Mutations: []store.SyncMutation{{Entity: store.SyncEntityObservation, EntityKey: "obs-1", Op: store.SyncOpUpsert, Payload: `{"sync_id":"obs-1","session_id":"s-1","project":"proj-stable","type":"decision","title":"older","created_at":"2026-04-23T09:59:00Z"}`}}},
+		},
+	}
+
+	model, err := buildDashboardReadModel(base)
+	if err != nil {
+		t.Fatalf("build dashboard read model: %v", err)
+	}
+	rows := model.filterObservations("proj-stable", "")
+	if len(rows) != 1 || rows[0].Title != "newer" {
+		t.Fatalf("expected deterministic replay winner from chunk-id ordering, got %+v", rows)
+	}
+
+	reversed := []dashboardChunkRow{base[1], base[0]}
+	modelReversed, err := buildDashboardReadModel(reversed)
+	if err != nil {
+		t.Fatalf("build dashboard read model reversed: %v", err)
+	}
+	rowsReversed := modelReversed.filterObservations("proj-stable", "")
+	if len(rowsReversed) != 1 || rowsReversed[0].Title != "newer" {
+		t.Fatalf("expected stable replay regardless input order, got %+v", rowsReversed)
+	}
+}
+
+func TestBuildDashboardReadModelRemovesSessionOnUpsertTombstone(t *testing.T) {
+	chunks := []dashboardChunkRow{
+		{
+			project:   "proj-tombstone",
+			createdBy: "alan@example.com",
+			createdAt: time.Date(2026, 4, 25, 9, 0, 0, 0, time.UTC),
+			parsed: engramsync.ChunkData{Mutations: []store.SyncMutation{{
+				Entity:    store.SyncEntitySession,
+				EntityKey: "s-tomb",
+				Op:        store.SyncOpUpsert,
+				Payload:   `{"id":"s-tomb","project":"proj-tombstone","started_at":"2026-04-25T09:00:00Z"}`,
+			}}},
+		},
+		{
+			project:   "proj-tombstone",
+			createdBy: "alan@example.com",
+			createdAt: time.Date(2026, 4, 25, 10, 0, 0, 0, time.UTC),
+			parsed: engramsync.ChunkData{Mutations: []store.SyncMutation{{
+				Entity:    store.SyncEntitySession,
+				EntityKey: "s-tomb",
+				Op:        store.SyncOpUpsert,
+				Payload:   `{"id":"s-tomb","project":"proj-tombstone","deleted_at":"2026-04-25T10:00:00Z"}`,
+			}}},
+		},
+	}
+
+	model, err := buildDashboardReadModel(chunks)
+	if err != nil {
+		t.Fatalf("build dashboard read model: %v", err)
+	}
+
+	detail := model.projectDetails["proj-tombstone"]
+	if len(detail.Sessions) != 0 {
+		t.Fatalf("expected upsert tombstone to remove session from detail list, got %+v", detail.Sessions)
+	}
+	if detail.Stats.Sessions != 0 {
+		t.Fatalf("expected upsert tombstone to remove session from stats, got %d", detail.Stats.Sessions)
+	}
+	if got := model.filterSessions("proj-tombstone", ""); len(got) != 0 {
+		t.Fatalf("expected browser sessions to omit tombstoned session, got %+v", got)
+	}
+}
+
+func TestBuildDashboardReadModelFailsOnMalformedMutationPayload(t *testing.T) {
+	_, err := buildDashboardReadModel([]dashboardChunkRow{{
+		chunkID:   "bad-chunk",
+		project:   "proj-bad",
+		createdBy: "alan@example.com",
+		createdAt: time.Date(2026, 4, 23, 10, 0, 0, 0, time.UTC),
+		parsed:    engramsync.ChunkData{Mutations: []store.SyncMutation{{Entity: store.SyncEntityObservation, EntityKey: "obs-1", Op: store.SyncOpUpsert, Payload: `{"sync_id":`}}},
+	}})
+	if err == nil {
+		t.Fatal("expected malformed mutation payload to fail read-model replay")
+	}
+	if !strings.Contains(err.Error(), "invalid dashboard mutation payload") {
+		t.Fatalf("expected malformed payload error context, got %v", err)
+	}
+}
+
+func TestDashboardReadModelScopedFiltersAllowlistAcrossSurfaces(t *testing.T) {
+	model, err := buildDashboardReadModel([]dashboardChunkRow{
+		{
+			chunkID:   "a1",
+			project:   "proj-a",
+			createdBy: "alan@example.com",
+			createdAt: time.Date(2026, 4, 21, 8, 0, 0, 0, time.UTC),
+			parsed:    parseMustChunk(t, []byte(`{"sessions":[{"id":"s-a","project":"proj-a","started_at":"2026-04-21T08:00:00Z"}]}`)),
+		},
+		{
+			chunkID:   "b1",
+			project:   "proj-b",
+			createdBy: "sofia@example.com",
+			createdAt: time.Date(2026, 4, 22, 8, 0, 0, 0, time.UTC),
+			parsed:    parseMustChunk(t, []byte(`{"sessions":[{"id":"s-b","project":"proj-b","started_at":"2026-04-22T08:00:00Z"}],"observations":[{"sync_id":"obs-b","session_id":"s-b","project":"proj-b","type":"decision","title":"B","created_at":"2026-04-22T08:10:00Z"}]}`)),
+		},
+	})
+	if err != nil {
+		t.Fatalf("build dashboard read model: %v", err)
+	}
+
+	scoped := model.scoped(map[string]struct{}{"proj-a": {}})
+	if len(scoped.projects) != 1 || scoped.projects[0].Project != "proj-a" {
+		t.Fatalf("expected projects surface scoped to allowlist, got %+v", scoped.projects)
+	}
+	if _, ok := scoped.projectDetails["proj-b"]; ok {
+		t.Fatalf("expected project detail scope to remove proj-b, got %+v", scoped.projectDetails["proj-b"])
+	}
+	if rows := scoped.filterSessions("", ""); len(rows) != 1 || rows[0].Project != "proj-a" {
+		t.Fatalf("expected browser sessions scoped to allowlist, got %+v", rows)
+	}
+	contributors := scoped.listContributors("")
+	if len(contributors) != 1 || contributors[0].CreatedBy != "alan@example.com" {
+		t.Fatalf("expected contributors scoped to allowlist projects, got %+v", contributors)
+	}
+	if scoped.admin.Projects != 1 || scoped.admin.Contributors != 1 || scoped.admin.Chunks != 1 {
+		t.Fatalf("expected admin overview scoped to allowlist, got %+v", scoped.admin)
+	}
+}
+
+func TestDashboardQuerySurfacesReuseCachedReadModelUntilInvalidated(t *testing.T) {
+	loadCalls := 0
+	cs := &CloudStore{}
+	cs.dashboardReadModelLoad = func() (dashboardReadModel, error) {
+		loadCalls++
+		return dashboardReadModel{
+			projects:     []DashboardProjectRow{{Project: "proj-a", Chunks: 1, Sessions: 1, Observations: 1, Prompts: 1}},
+			contributors: []DashboardContributorRow{{CreatedBy: "alan@example.com", Chunks: 1, Projects: 1}},
+			projectDetails: map[string]DashboardProjectDetail{
+				"proj-a": {
+					Project:      "proj-a",
+					Stats:        DashboardProjectRow{Project: "proj-a", Chunks: 1, Sessions: 1, Observations: 1, Prompts: 1},
+					Contributors: []DashboardContributorRow{{CreatedBy: "alan@example.com", Chunks: 1, Projects: 1}},
+					Sessions:     []DashboardSessionRow{{Project: "proj-a", SessionID: "s-1", StartedAt: "2026-04-22T10:00:00Z"}},
+					Observations: []DashboardObservationRow{{Project: "proj-a", SessionID: "s-1", Type: "decision", Title: "Decision A", CreatedAt: "2026-04-22T10:10:00Z"}},
+					Prompts:      []DashboardPromptRow{{Project: "proj-a", SessionID: "s-1", Content: "Prompt A", CreatedAt: "2026-04-22T10:20:00Z"}},
+				},
+			},
+			admin: DashboardAdminOverview{Projects: 1, Contributors: 1, Chunks: 1},
+		}, nil
+	}
+
+	if rows, err := cs.ListProjects(""); err != nil || len(rows) != 1 {
+		t.Fatalf("expected projects from cached model, rows=%+v err=%v", rows, err)
+	}
+	if rows, err := cs.ListContributors("alan"); err != nil || len(rows) != 1 {
+		t.Fatalf("expected contributors from cached model, rows=%+v err=%v", rows, err)
+	}
+	if detail, err := cs.ProjectDetail("proj-a"); err != nil || detail.Project != "proj-a" {
+		t.Fatalf("expected project detail from cached model, detail=%+v err=%v", detail, err)
+	}
+	if rows, err := cs.ListRecentSessions("proj-a", "", 10); err != nil || len(rows) != 1 {
+		t.Fatalf("expected sessions from cached model, rows=%+v err=%v", rows, err)
+	}
+	if rows, err := cs.ListRecentObservations("proj-a", "", 10); err != nil || len(rows) != 1 {
+		t.Fatalf("expected observations from cached model, rows=%+v err=%v", rows, err)
+	}
+	if rows, err := cs.ListRecentPrompts("proj-a", "", 10); err != nil || len(rows) != 1 {
+		t.Fatalf("expected prompts from cached model, rows=%+v err=%v", rows, err)
+	}
+	if overview, err := cs.AdminOverview(); err != nil || overview.Projects != 1 {
+		t.Fatalf("expected admin overview from cached model, overview=%+v err=%v", overview, err)
+	}
+
+	if loadCalls != 1 {
+		t.Fatalf("expected one read-model load across all dashboard queries, got %d", loadCalls)
+	}
+
+	cs.invalidateDashboardReadModel()
+	if _, err := cs.ListProjects(""); err != nil {
+		t.Fatalf("expected projects query after explicit invalidation, got %v", err)
+	}
+	if loadCalls != 2 {
+		t.Fatalf("expected cache invalidation to force one reload, got %d", loadCalls)
+	}
+}
+
+func TestSetDashboardAllowedProjectsInvalidatesCachedReadModel(t *testing.T) {
+	loadCalls := 0
+	cs := &CloudStore{}
+	cs.dashboardReadModelLoad = func() (dashboardReadModel, error) {
+		loadCalls++
+		return dashboardReadModel{}, nil
+	}
+
+	if _, err := cs.ListProjects(""); err != nil {
+		t.Fatalf("expected initial list projects call to succeed, got %v", err)
+	}
+	if loadCalls != 1 {
+		t.Fatalf("expected initial load count=1, got %d", loadCalls)
+	}
+
+	cs.SetDashboardAllowedProjects([]string{"proj-a"})
+	if _, err := cs.ListProjects(""); err != nil {
+		t.Fatalf("expected list projects after allowlist update to succeed, got %v", err)
+	}
+	if loadCalls != 2 {
+		t.Fatalf("expected allowlist update to invalidate read-model cache, got load count %d", loadCalls)
+	}
 }

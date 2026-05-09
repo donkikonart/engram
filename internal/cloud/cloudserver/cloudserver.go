@@ -1,464 +1,668 @@
 package cloudserver
 
 import (
-	"database/sql"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/Gentleman-Programming/engram/internal/cloud/auth"
+	"github.com/Gentleman-Programming/engram/internal/cloud/chunkcodec"
 	"github.com/Gentleman-Programming/engram/internal/cloud/cloudstore"
+	"github.com/Gentleman-Programming/engram/internal/cloud/constants"
 	"github.com/Gentleman-Programming/engram/internal/cloud/dashboard"
+	engramproject "github.com/Gentleman-Programming/engram/internal/project"
+	"github.com/Gentleman-Programming/engram/internal/store"
+	engramsync "github.com/Gentleman-Programming/engram/internal/sync"
 )
 
-// ─── CloudServer ────────────────────────────────────────────────────────────
-
-// CloudServer provides the HTTP API for Engram cloud mode.
-type CloudServer struct {
-	store   *cloudstore.CloudStore
-	auth    *auth.Service
-	mux     *http.ServeMux
-	port    int
-	listen  func(network, address string) (net.Listener, error)
-	serve   func(net.Listener, http.Handler) error
-	now     func() time.Time
-	limit   *authRateLimiter
-	dashCfg dashboard.DashboardConfig
-}
-
-// New creates a new CloudServer and registers all routes.
-func New(store *cloudstore.CloudStore, authSvc *auth.Service, port int, opts ...Option) *CloudServer {
-	srv := &CloudServer{
-		store:  store,
-		auth:   authSvc,
-		port:   port,
-		listen: net.Listen,
-		serve:  http.Serve,
-		now:    time.Now,
-	}
-	for _, opt := range opts {
-		opt(srv)
-	}
-	srv.limit = newAuthRateLimiter(func() time.Time { return srv.now() })
-	srv.mux = http.NewServeMux()
-	srv.routes()
-	return srv
-}
-
-// Option configures a CloudServer.
 type Option func(*CloudServer)
 
-// WithDashboard enables the embedded web dashboard with the given config.
-func WithDashboard(cfg dashboard.DashboardConfig) Option {
+type ChunkStore interface {
+	ReadManifest(ctx context.Context, project string) (*engramsync.Manifest, error)
+	WriteChunk(ctx context.Context, project, chunkID, createdBy, clientCreatedAt string, payload []byte) error
+	ReadChunk(ctx context.Context, project, chunkID string) ([]byte, error)
+	KnownSessionIDs(ctx context.Context, project string) (map[string]struct{}, error)
+}
+
+type Authenticator interface {
+	Authorize(r *http.Request) error
+}
+
+type ProjectAuthorizer interface {
+	AuthorizeProject(project string) error
+}
+
+type dashboardSessionCodec interface {
+	MintDashboardSession(bearerToken string) (string, error)
+	ParseDashboardSession(sessionToken string) (string, error)
+}
+
+type staticStatusProvider struct{ status dashboard.SyncStatus }
+
+func (s staticStatusProvider) Status() dashboard.SyncStatus { return s.status }
+
+type CloudServer struct {
+	store          ChunkStore
+	auth           Authenticator
+	projectAuth    ProjectAuthorizer
+	dashboardAdmin string
+	port           int
+	host           string
+	mux            *http.ServeMux
+	syncStatus     dashboard.SyncStatusProvider
+	listenAndServe func(addr string, handler http.Handler) error
+}
+
+const defaultHost = "127.0.0.1"
+const maxPushBodyBytes int64 = 8 * 1024 * 1024
+const maxDashboardLoginBodyBytes int64 = 16 * 1024
+const dashboardSessionCookieName = "engram_dashboard_token"
+
+var ErrDashboardSessionCodecRequired = errors.New("dashboard session codec is required for dashboard auth")
+
+func WithSyncStatusProvider(provider dashboard.SyncStatusProvider) Option {
 	return func(s *CloudServer) {
-		s.dashCfg = cfg
+		s.syncStatus = provider
 	}
 }
 
-// Start binds to the configured port and serves HTTP traffic. It matches
-// the pattern from internal/server/server.go.
+func WithHost(host string) Option {
+	return func(s *CloudServer) {
+		s.host = strings.TrimSpace(host)
+	}
+}
+
+func WithProjectAuthorizer(authorizer ProjectAuthorizer) Option {
+	return func(s *CloudServer) {
+		s.projectAuth = authorizer
+	}
+}
+
+func WithDashboardAdminToken(adminToken string) Option {
+	return func(s *CloudServer) {
+		s.dashboardAdmin = strings.TrimSpace(adminToken)
+	}
+}
+
+func New(store ChunkStore, authSvc Authenticator, port int, opts ...Option) *CloudServer {
+	s := &CloudServer{
+		store: store,
+		auth:  authSvc,
+		port:  port,
+		host:  defaultHost,
+		syncStatus: staticStatusProvider{status: dashboard.SyncStatus{
+			Phase:         "degraded",
+			ReasonCode:    constants.ReasonTransportFailed,
+			ReasonMessage: "sync status provider is unavailable",
+		}},
+		listenAndServe: http.ListenAndServe,
+	}
+	if projectAuthorizer, ok := authSvc.(ProjectAuthorizer); ok {
+		s.projectAuth = projectAuthorizer
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	s.routes()
+	return s
+}
+
 func (s *CloudServer) Start() error {
-	addr := fmt.Sprintf(":%d", s.port)
-	listenFn := s.listen
-	if listenFn == nil {
-		listenFn = net.Listen
+	host := strings.TrimSpace(s.host)
+	if host == "" {
+		host = defaultHost
 	}
-	serveFn := s.serve
-	if serveFn == nil {
-		serveFn = http.Serve
-	}
-
-	ln, err := listenFn("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("engram cloud server: listen %s: %w", addr, err)
-	}
-	log.Printf("[engram-cloud] HTTP server listening on %s", addr)
-	return serveFn(ln, s.mux)
+	addr := fmt.Sprintf("%s:%d", host, s.port)
+	log.Printf("[engram-cloud] listening on %s", addr)
+	return s.listenAndServe(addr, s.Handler())
 }
 
-// Handler returns the underlying http.Handler for testing.
 func (s *CloudServer) Handler() http.Handler {
+	if s.mux == nil {
+		s.routes()
+	}
 	return s.mux
 }
 
-// ─── Route Registration ─────────────────────────────────────────────────────
-
 func (s *CloudServer) routes() {
-	// Health (no auth)
+	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("GET /health", s.handleHealth)
-
-	// Auth routes (no auth required)
-	s.mux.HandleFunc("POST /auth/register", s.handleRegister)
-	s.mux.HandleFunc("POST /auth/login", s.handleLogin)
-	s.mux.HandleFunc("POST /auth/refresh", s.handleRefresh)
-
-	// API key management (auth required)
-	s.mux.HandleFunc("POST /auth/api-key", s.withAuth(s.handleGenerateAPIKey))
-	s.mux.HandleFunc("DELETE /auth/api-key", s.withAuth(s.handleRevokeAPIKey))
-
-	// Sync routes (auth required)
-	s.mux.HandleFunc("POST /sync/push", s.withAuth(s.handlePush))
+	var dashboardStore dashboard.DashboardStore
+	if store, ok := s.store.(dashboard.DashboardStore); ok {
+		dashboardStore = store
+	}
+	validateLoginToken := func(token string) error {
+		token = strings.TrimSpace(token)
+		if token == "" {
+			return fmt.Errorf("bearer token is required")
+		}
+		if adminToken := strings.TrimSpace(s.dashboardAdmin); adminToken != "" && token == adminToken {
+			return nil
+		}
+		if s.auth == nil {
+			return nil
+		}
+		req, _ := http.NewRequest(http.MethodGet, "/dashboard/login", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		return s.auth.Authorize(req)
+	}
+	createSessionCookie := func(w http.ResponseWriter, r *http.Request, token string) error {
+		sessionToken, err := s.dashboardSessionToken(token)
+		if err != nil {
+			return err
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:     dashboardSessionCookieName,
+			Value:    sessionToken,
+			Path:     "/dashboard",
+			HttpOnly: true,
+			Secure:   dashboardCookieSecure(r),
+			SameSite: http.SameSiteLaxMode,
+			MaxAge:   int((8 * time.Hour).Seconds()),
+		})
+		return nil
+	}
+	if s.auth == nil {
+		validateLoginToken = nil
+		createSessionCookie = nil
+	}
+	dashboard.Mount(s.mux, dashboard.MountConfig{
+		RequireSession:      s.authorizeDashboardRequest,
+		ValidateLoginToken:  validateLoginToken,
+		CreateSessionCookie: createSessionCookie,
+		ClearSessionCookie: func(w http.ResponseWriter, r *http.Request) {
+			http.SetCookie(w, &http.Cookie{
+				Name:     dashboardSessionCookieName,
+				Value:    "",
+				Path:     "/dashboard",
+				HttpOnly: true,
+				Secure:   dashboardCookieSecure(r),
+				SameSite: http.SameSiteLaxMode,
+				MaxAge:   -1,
+			})
+		},
+		IsAdmin: func(r *http.Request) bool {
+			return s.isDashboardAdmin(r)
+		},
+		// GetDisplayName: returns "OPERATOR" until the session codec surfaces a
+		// display name (out of scope for this change). Satisfies REQ-103 / AD-2.
+		GetDisplayName:    func(r *http.Request) string { return "OPERATOR" },
+		Store:             dashboardStore,
+		MaxLoginBodyBytes: maxDashboardLoginBodyBytes,
+		StatusProvider:    s.syncStatus,
+	})
 	s.mux.HandleFunc("GET /sync/pull", s.withAuth(s.handlePullManifest))
-	s.mux.HandleFunc("GET /sync/pull/{chunk_id}", s.withAuth(s.handlePullChunk))
-
-	// Mutation-based sync routes (auth required)
+	s.mux.HandleFunc("GET /sync/pull/{chunkID}", s.withAuth(s.handlePullChunk))
+	s.mux.HandleFunc("POST /sync/push", s.withAuth(s.handlePushChunk))
 	s.mux.HandleFunc("POST /sync/mutations/push", s.withAuth(s.handleMutationPush))
 	s.mux.HandleFunc("GET /sync/mutations/pull", s.withAuth(s.handleMutationPull))
-
-	// Search & context (auth required)
-	s.mux.HandleFunc("GET /sync/search", s.withAuth(s.handleSearch))
-	s.mux.HandleFunc("GET /sync/context", s.withAuth(s.handleContext))
-
-	// Dashboard — embedded web UI
-	dashboard.Mount(s.mux, s.store, s.auth, s.dashCfg)
 }
 
-// ─── Health ─────────────────────────────────────────────────────────────────
+func (s *CloudServer) withAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.auth != nil {
+			if err := s.auth.Authorize(r); err != nil {
+				http.Error(w, fmt.Sprintf("unauthorized: %v", err), http.StatusUnauthorized)
+				return
+			}
+		}
+		next(w, r)
+	}
+}
 
-func (s *CloudServer) handleHealth(w http.ResponseWriter, r *http.Request) {
-	if s.store != nil {
-		if err := s.store.Ping(); err != nil {
-			jsonResponse(w, http.StatusServiceUnavailable, map[string]any{
-				"status":   "degraded",
-				"service":  "engram-cloud",
-				"version":  "0.1.0",
-				"database": "unavailable",
+func (s *CloudServer) withAuthHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.auth != nil {
+			if err := s.auth.Authorize(r); err != nil {
+				http.Error(w, fmt.Sprintf("unauthorized: %v", err), http.StatusUnauthorized)
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *CloudServer) authorizeDashboardRequest(r *http.Request) error {
+	if s.auth == nil {
+		return nil
+	}
+	cookie, err := r.Cookie(dashboardSessionCookieName)
+	if err != nil {
+		return err
+	}
+	bearerToken, err := s.dashboardBearerToken(cookie.Value)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(bearerToken) == "" {
+		return fmt.Errorf("dashboard session token is empty")
+	}
+	if adminToken := strings.TrimSpace(s.dashboardAdmin); adminToken != "" && bearerToken == adminToken {
+		return nil
+	}
+	req, _ := http.NewRequest(http.MethodGet, "/dashboard", nil)
+	req.Header.Set("Authorization", "Bearer "+bearerToken)
+	return s.auth.Authorize(req)
+}
+
+func (s *CloudServer) dashboardSessionToken(bearerToken string) (string, error) {
+	if codec, ok := s.auth.(dashboardSessionCodec); ok {
+		return codec.MintDashboardSession(bearerToken)
+	}
+	return "", ErrDashboardSessionCodecRequired
+}
+
+func (s *CloudServer) dashboardBearerToken(sessionToken string) (string, error) {
+	sessionToken = strings.TrimSpace(sessionToken)
+	if sessionToken == "" {
+		return "", fmt.Errorf("dashboard session token is empty")
+	}
+	if codec, ok := s.auth.(dashboardSessionCodec); ok {
+		return codec.ParseDashboardSession(sessionToken)
+	}
+	return "", ErrDashboardSessionCodecRequired
+}
+
+func dashboardCookieSecure(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	forwardedProto := r.Header.Get("X-Forwarded-Proto")
+	for _, proto := range strings.Split(forwardedProto, ",") {
+		if strings.EqualFold(strings.TrimSpace(proto), "https") {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *CloudServer) handleHealth(w http.ResponseWriter, _ *http.Request) {
+	jsonResponse(w, http.StatusOK, map[string]any{"status": "ok", "service": "engram-cloud"})
+}
+
+func (s *CloudServer) isDashboardAdmin(r *http.Request) bool {
+	if s.auth == nil {
+		return false
+	}
+	adminToken := strings.TrimSpace(s.dashboardAdmin)
+	if adminToken == "" {
+		return false
+	}
+	cookie, err := r.Cookie(dashboardSessionCookieName)
+	if err != nil {
+		return false
+	}
+	token, err := s.dashboardBearerToken(cookie.Value)
+	if err != nil {
+		return false
+	}
+	return token == adminToken
+}
+
+func (s *CloudServer) handlePullManifest(w http.ResponseWriter, r *http.Request) {
+	project, ok := projectFromRequest(w, r)
+	if !ok {
+		return
+	}
+	if !s.authorizeProjectScope(w, project) {
+		return
+	}
+	manifest, err := s.store.ReadManifest(r.Context(), project)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("read manifest: %v", err), http.StatusInternalServerError)
+		return
+	}
+	jsonResponse(w, http.StatusOK, manifest)
+}
+
+func (s *CloudServer) handlePullChunk(w http.ResponseWriter, r *http.Request) {
+	project, ok := projectFromRequest(w, r)
+	if !ok {
+		return
+	}
+	if !s.authorizeProjectScope(w, project) {
+		return
+	}
+	chunkID := strings.TrimSpace(r.PathValue("chunkID"))
+	if chunkID == "" {
+		http.Error(w, "chunkID is required", http.StatusBadRequest)
+		return
+	}
+	chunk, err := s.store.ReadChunk(r.Context(), project, chunkID)
+	if err != nil {
+		if errors.Is(err, cloudstore.ErrChunkNotFound) {
+			http.Error(w, fmt.Sprintf("read chunk: %v", err), http.StatusNotFound)
+			return
+		}
+		http.Error(w, fmt.Sprintf("read chunk: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(chunk)
+}
+
+func (s *CloudServer) handlePushChunk(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxPushBodyBytes)
+	var req struct {
+		ChunkID         string          `json:"chunk_id"`
+		CreatedBy       string          `json:"created_by"`
+		ClientCreatedAt string          `json:"client_created_at"`
+		Project         string          `json:"project"`
+		Data            json.RawMessage `json:"data"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeActionableError(w, http.StatusRequestEntityTooLarge, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadTooLarge, fmt.Sprintf("push payload too large (max %d bytes)", maxPushBodyBytes))
+			return
+		}
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, fmt.Sprintf("invalid push payload: %v", err))
+		return
+	}
+	if len(req.Data) == 0 {
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, "data is required")
+		return
+	}
+	project := strings.TrimSpace(req.Project)
+	if project == "" {
+		project = strings.TrimSpace(r.URL.Query().Get("project"))
+	}
+	if project == "" {
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassBlocked, constants.UpgradeErrorCodeProjectRequired, "project is required")
+		return
+	}
+	project, _ = store.NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassBlocked, constants.UpgradeErrorCodeProjectRequired, "project is required")
+		return
+	}
+	if !s.authorizeProjectScope(w, project) {
+		return
+	}
+
+	// Push-path pause guard: check project sync control before accepting the chunk.
+	// Uses a structural interface assertion so the ChunkStore interface is NOT extended.
+	// Satisfies REQ-109 / Design Decision 5.
+	if storeForControls, ok := s.store.(interface {
+		IsProjectSyncEnabled(project string) (bool, error)
+	}); ok {
+		enabled, err := storeForControls.IsProjectSyncEnabled(project)
+		if err != nil {
+			writeActionableError(w, http.StatusInternalServerError,
+				constants.UpgradeErrorClassBlocked,
+				constants.UpgradeErrorCodeInternal,
+				fmt.Sprintf("check project control: %v", err))
+			return
+		}
+		if !enabled {
+			// REQ-405: emit audit entry for chunk-push pause-rejection before writing 409.
+			// Structural type assertion — ChunkStore is NOT extended.
+			contributor := strings.TrimSpace(req.CreatedBy)
+			if contributor == "" {
+				contributor = "unknown"
+			}
+			if auditor, ok := s.store.(interface {
+				InsertAuditEntry(ctx context.Context, entry cloudstore.AuditEntry) error
+			}); ok {
+				if aerr := auditor.InsertAuditEntry(r.Context(), cloudstore.AuditEntry{
+					Contributor: contributor,
+					Project:     project,
+					Action:      cloudstore.AuditActionChunkPush,
+					Outcome:     cloudstore.AuditOutcomeRejectedProjectPaused,
+					ReasonCode:  "sync-paused",
+				}); aerr != nil {
+					log.Printf("cloudserver: audit insert failed (chunk push): %v", aerr)
+				}
+			} else {
+				log.Printf("cloudserver: store (%T) does not implement InsertAuditEntry; audit skipped", s.store)
+			}
+			// JW4: include project envelope fields in 409 response, consistent
+			// with the mutation push 409 envelope (REQ-414 parity for chunk path).
+			jsonResponse(w, http.StatusConflict, map[string]any{
+				"error_class":    strings.TrimSpace(constants.UpgradeErrorClassPolicy),
+				"error_code":     "sync-paused",
+				"error":          fmt.Sprintf("sync is paused for project %q", project),
+				"project":        project,
+				"project_source": engramproject.SourceRequestBody,
+				"project_path":   "",
 			})
 			return
 		}
 	}
 
-	jsonResponse(w, http.StatusOK, map[string]any{
-		"status":  "ok",
-		"service": "engram-cloud",
-		"version": "0.1.0",
-	})
-}
-
-// ─── Auth Handlers ──────────────────────────────────────────────────────────
-
-func (s *CloudServer) handleRegister(w http.ResponseWriter, r *http.Request) {
-	if retryAfter, limited := s.checkRateLimit(r, "register", 5); limited {
-		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-		jsonError(w, http.StatusTooManyRequests, "rate limit exceeded")
-		return
-	}
-
-	var body struct {
-		Username string `json:"username"`
-		Email    string `json:"email"`
-		Password string `json:"password"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
-		return
-	}
-	if body.Username == "" || body.Email == "" || body.Password == "" {
-		jsonError(w, http.StatusBadRequest, "username, email, and password are required")
-		return
-	}
-
-	result, err := s.auth.Register(body.Username, body.Email, body.Password)
+	normalizedData, err := coerceChunkProject(req.Data, project)
 	if err != nil {
-		if err == auth.ErrWeakPassword {
-			jsonError(w, http.StatusBadRequest, err.Error())
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, fmt.Sprintf("invalid push payload: %v", err))
+		return
+	}
+	chunk, err := validateImportableChunkPayload(normalizedData)
+	if err != nil {
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, fmt.Sprintf("invalid push payload: %v", err))
+		return
+	}
+	knownSessionIDs, err := s.store.KnownSessionIDs(r.Context(), project)
+	if err != nil {
+		writeActionableError(w, http.StatusInternalServerError, constants.UpgradeErrorClassBlocked, constants.UpgradeErrorCodeInternal, fmt.Sprintf("validate push payload: %v", err))
+		return
+	}
+	if err := validateChunkSessionReferences(chunk, knownSessionIDs); err != nil {
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, fmt.Sprintf("invalid push payload: %v", err))
+		return
+	}
+
+	computedChunkID := chunkIDFromPayload(normalizedData)
+	providedChunkID := strings.TrimSpace(req.ChunkID)
+	if providedChunkID != "" && providedChunkID != computedChunkID {
+		log.Printf("cloudserver: chunk_id mismatch for project %q: client=%q server=%q; accepting server-canonicalized payload", project, providedChunkID, computedChunkID)
+	}
+	clientCreatedAt := strings.TrimSpace(req.ClientCreatedAt)
+	if clientCreatedAt != "" {
+		if _, err := time.Parse(time.RFC3339, clientCreatedAt); err != nil {
+			writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodePayloadInvalid, "client_created_at must be RFC3339")
 			return
 		}
-		if duplicateField := duplicateRegistrationField(err); duplicateField != "" {
-			jsonError(w, http.StatusConflict, duplicateField+" is already registered")
+	}
+
+	if err := s.store.WriteChunk(r.Context(), project, computedChunkID, req.CreatedBy, clientCreatedAt, normalizedData); err != nil {
+		if errors.Is(err, cloudstore.ErrChunkConflict) {
+			writeActionableError(w, http.StatusConflict, constants.UpgradeErrorClassRepairable, constants.UpgradeErrorCodeChunkConflict, fmt.Sprintf("write chunk: %v", err))
 			return
 		}
-		writeStoreError(w, err, err.Error())
+		writeActionableError(w, http.StatusInternalServerError, constants.UpgradeErrorClassBlocked, constants.UpgradeErrorCodeInternal, fmt.Sprintf("write chunk: %v", err))
 		return
 	}
-
-	jsonResponse(w, http.StatusCreated, result)
+	jsonResponse(w, http.StatusOK, map[string]any{"status": "ok", "chunk_id": computedChunkID})
 }
 
-func duplicateRegistrationField(err error) string {
-	msg := strings.ToLower(err.Error())
-	switch {
-	case strings.Contains(msg, "cloud_users_email_key") || strings.Contains(msg, "duplicate key") && strings.Contains(msg, "email"):
-		return "email"
-	case strings.Contains(msg, "cloud_users_username_key") || strings.Contains(msg, "duplicate key") && strings.Contains(msg, "username"):
-		return "username"
-	default:
-		return ""
-	}
+func chunkIDFromPayload(payload []byte) string {
+	return chunkcodec.ChunkID(payload)
 }
 
-func (s *CloudServer) handleLogin(w http.ResponseWriter, r *http.Request) {
-	if retryAfter, limited := s.checkRateLimit(r, "login", 10); limited {
-		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
-		jsonError(w, http.StatusTooManyRequests, "rate limit exceeded")
-		return
+func projectFromRequest(w http.ResponseWriter, r *http.Request) (string, bool) {
+	project := strings.TrimSpace(r.URL.Query().Get("project"))
+	if project == "" {
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassBlocked, constants.UpgradeErrorCodeProjectRequired, "project is required")
+		return "", false
 	}
-
-	var body struct {
-		Identifier string `json:"identifier"`
-		Username   string `json:"username"`
-		Password   string `json:"password"`
+	project, _ = store.NormalizeProject(project)
+	project = strings.TrimSpace(project)
+	if project == "" {
+		writeActionableError(w, http.StatusBadRequest, constants.UpgradeErrorClassBlocked, constants.UpgradeErrorCodeProjectRequired, "project is required")
+		return "", false
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
-		return
-	}
-	identifier := strings.TrimSpace(body.Identifier)
-	if identifier == "" {
-		identifier = strings.TrimSpace(body.Username)
-	}
-	if identifier == "" || body.Password == "" {
-		jsonError(w, http.StatusBadRequest, "identifier and password are required")
-		return
-	}
-
-	result, err := s.auth.Login(identifier, body.Password)
-	if err != nil {
-		if err == auth.ErrInvalidCredentials {
-			jsonError(w, http.StatusUnauthorized, "invalid credentials")
-			return
-		}
-		writeStoreError(w, err, err.Error())
-		return
-	}
-
-	jsonResponse(w, http.StatusOK, result)
+	return project, true
 }
 
-func (s *CloudServer) handleRefresh(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		RefreshToken string `json:"refresh_token"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		jsonError(w, http.StatusBadRequest, "invalid json: "+err.Error())
-		return
-	}
-	if body.RefreshToken == "" {
-		jsonError(w, http.StatusBadRequest, "refresh_token is required")
-		return
-	}
-
-	newAccessToken, err := s.auth.RefreshAccessToken(body.RefreshToken)
-	if err != nil {
-		jsonError(w, http.StatusUnauthorized, "invalid or expired refresh token")
-		return
-	}
-
-	jsonResponse(w, http.StatusOK, map[string]any{
-		"access_token": newAccessToken,
-		"expires_in":   3600,
-	})
-}
-
-// ─── API Key Handlers ───────────────────────────────────────────────────────
-
-func (s *CloudServer) handleGenerateAPIKey(w http.ResponseWriter, r *http.Request) {
-	userID := getUserID(r)
-
-	plainKey, hash, err := auth.GenerateAPIKey()
-	if err != nil {
-		jsonError(w, http.StatusInternalServerError, "failed to generate api key")
-		return
-	}
-
-	if err := s.store.SetAPIKeyHash(userID, hash); err != nil {
-		writeStoreError(w, err, "failed to store api key")
-		return
-	}
-
-	jsonResponse(w, http.StatusCreated, map[string]string{
-		"api_key": plainKey,
-		"message": "Store this key securely. It will not be shown again.",
-	})
-}
-
-func (s *CloudServer) handleRevokeAPIKey(w http.ResponseWriter, r *http.Request) {
-	userID := getUserID(r)
-
-	if err := s.store.SetAPIKeyHash(userID, ""); err != nil {
-		writeStoreError(w, err, "failed to revoke api key")
-		return
-	}
-
-	jsonResponse(w, http.StatusOK, map[string]string{
-		"status": "revoked",
-	})
-}
-
-// ─── Search Handler ─────────────────────────────────────────────────────────
-
-func (s *CloudServer) handleSearch(w http.ResponseWriter, r *http.Request) {
-	userID := getUserID(r)
-
-	query := r.URL.Query().Get("q")
-	if query == "" {
-		jsonError(w, http.StatusBadRequest, "q parameter is required")
-		return
-	}
-
-	results, err := s.store.Search(userID, query, cloudstore.CloudSearchOptions{
-		Type:    r.URL.Query().Get("type"),
-		Project: r.URL.Query().Get("project"),
-		Scope:   r.URL.Query().Get("scope"),
-		Limit:   queryInt(r, "limit", 10),
-	})
-	if err != nil {
-		writeStoreError(w, err, err.Error())
-		return
-	}
-
-	jsonResponse(w, http.StatusOK, map[string]any{
-		"results": results,
-	})
-}
-
-// ─── Context Handler ────────────────────────────────────────────────────────
-
-func (s *CloudServer) handleContext(w http.ResponseWriter, r *http.Request) {
-	userID := getUserID(r)
-
-	project := r.URL.Query().Get("project")
-	scope := r.URL.Query().Get("scope")
-
-	ctx, err := s.store.FormatContext(userID, project, scope)
-	if err != nil {
-		writeStoreError(w, err, err.Error())
-		return
-	}
-
-	jsonResponse(w, http.StatusOK, map[string]string{
-		"context": ctx,
-	})
-}
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
-
-func jsonResponse(w http.ResponseWriter, status int, data any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
-}
-
-func jsonError(w http.ResponseWriter, status int, msg string) {
-	jsonResponse(w, status, map[string]string{"error": msg})
-}
-
-func writeStoreError(w http.ResponseWriter, err error, fallback string) {
-	if isDBConnectionError(err) {
-		jsonError(w, http.StatusServiceUnavailable, "database unavailable")
-		return
-	}
-	jsonError(w, http.StatusInternalServerError, fallback)
-}
-
-func queryInt(r *http.Request, key string, defaultVal int) int {
-	v := r.URL.Query().Get(key)
-	if v == "" {
-		return defaultVal
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return defaultVal
-	}
-	return n
-}
-
-// isDBConnectionError checks if an error indicates a Postgres connection
-// failure, mapping to HTTP 503.
-func isDBConnectionError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, sql.ErrConnDone) {
+func (s *CloudServer) authorizeProjectScope(w http.ResponseWriter, project string) bool {
+	if s.projectAuth == nil {
 		return true
 	}
-	msg := err.Error()
-	return strings.Contains(msg, "connection refused") ||
-		strings.Contains(msg, "connection reset") ||
-		strings.Contains(msg, "broken pipe") ||
-		strings.Contains(msg, "no connection") ||
-		strings.Contains(msg, "driver: bad connection") ||
-		strings.Contains(msg, "database is closed") ||
-		strings.Contains(msg, "connection not open") ||
-		strings.Contains(msg, "sql: database is closed")
-}
-
-type authRateLimiter struct {
-	now      func() time.Time
-	mu       sync.Mutex
-	attempts map[string]rateLimitState
-}
-
-type rateLimitState struct {
-	count   int
-	resetAt time.Time
-}
-
-func newAuthRateLimiter(now func() time.Time) *authRateLimiter {
-	return &authRateLimiter{
-		now:      now,
-		attempts: make(map[string]rateLimitState),
+	if err := s.projectAuth.AuthorizeProject(project); err != nil {
+		writeActionableError(w, http.StatusForbidden, constants.UpgradeErrorClassPolicy, constants.ReasonPolicyForbidden, "forbidden: project is not allowed")
+		return false
 	}
+	return true
 }
 
-func (s *CloudServer) checkRateLimit(r *http.Request, endpoint string, maxAttempts int) (int, bool) {
-	if s.limit == nil {
-		return 0, false
+func writeActionableError(w http.ResponseWriter, status int, class, code, message string) {
+	jsonResponse(w, status, map[string]any{
+		"error_class": strings.TrimSpace(class),
+		"error_code":  strings.TrimSpace(code),
+		"error":       strings.TrimSpace(message),
+	})
+}
+
+func coerceChunkProject(payload []byte, project string) ([]byte, error) {
+	return chunkcodec.CanonicalizeForProject(payload, project)
+}
+
+func decodeSyncMutationPayload(payload string, dest any) error {
+	return chunkcodec.DecodeSyncMutationPayload(payload, dest)
+}
+
+func validateImportableChunkPayload(payload []byte) (engramsync.ChunkData, error) {
+	var chunk engramsync.ChunkData
+	if err := json.Unmarshal(payload, &chunk); err != nil {
+		return engramsync.ChunkData{}, fmt.Errorf("chunk schema: %w", err)
 	}
-	key := endpoint + ":" + clientIP(r)
-	return s.limit.allow(key, maxAttempts, time.Minute)
+	if err := validateDirectChunkArrayEntries(chunk); err != nil {
+		return engramsync.ChunkData{}, err
+	}
+	return chunk, nil
+
 }
 
-func (rl *authRateLimiter) allow(key string, maxAttempts int, window time.Duration) (int, bool) {
-	now := rl.now()
-
-	rl.mu.Lock()
-	defer rl.mu.Unlock()
-
-	for existingKey, state := range rl.attempts {
-		if !now.Before(state.resetAt) {
-			delete(rl.attempts, existingKey)
+func validateDirectChunkArrayEntries(chunk engramsync.ChunkData) error {
+	for i, session := range chunk.Sessions {
+		if strings.TrimSpace(session.ID) == "" {
+			return fmt.Errorf("sessions[%d].id is required", i)
+		}
+		if strings.TrimSpace(session.Directory) == "" {
+			return fmt.Errorf("sessions[%d].directory is required", i)
 		}
 	}
 
-	state := rl.attempts[key]
-	if state.resetAt.IsZero() || !now.Before(state.resetAt) {
-		state = rateLimitState{resetAt: now.Add(window)}
-	}
-	if state.count >= maxAttempts {
-		retryAfter := int(time.Until(state.resetAt).Seconds())
-		if retryAfter < 1 {
-			retryAfter = 1
+	for i, observation := range chunk.Observations {
+		if strings.TrimSpace(observation.SyncID) == "" {
+			return fmt.Errorf("observations[%d].sync_id is required", i)
 		}
-		rl.attempts[key] = state
-		return retryAfter, true
+		if strings.TrimSpace(observation.SessionID) == "" {
+			return fmt.Errorf("observations[%d].session_id is required", i)
+		}
+		if strings.TrimSpace(observation.Type) == "" {
+			return fmt.Errorf("observations[%d].type is required", i)
+		}
+		if strings.TrimSpace(observation.Title) == "" {
+			return fmt.Errorf("observations[%d].title is required", i)
+		}
+		if strings.TrimSpace(observation.Content) == "" {
+			return fmt.Errorf("observations[%d].content is required", i)
+		}
+		if strings.TrimSpace(observation.Scope) == "" {
+			return fmt.Errorf("observations[%d].scope is required", i)
+		}
 	}
 
-	state.count++
-	rl.attempts[key] = state
-	return 0, false
+	for i, prompt := range chunk.Prompts {
+		if strings.TrimSpace(prompt.SyncID) == "" {
+			return fmt.Errorf("prompts[%d].sync_id is required", i)
+		}
+		if strings.TrimSpace(prompt.SessionID) == "" {
+			return fmt.Errorf("prompts[%d].session_id is required", i)
+		}
+		if strings.TrimSpace(prompt.Content) == "" {
+			return fmt.Errorf("prompts[%d].content is required", i)
+		}
+	}
+
+	return nil
 }
 
-func clientIP(r *http.Request) string {
-	if forwarded := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); forwarded != "" {
-		parts := strings.Split(forwarded, ",")
-		if ip := strings.TrimSpace(parts[0]); ip != "" {
-			return ip
+func validateChunkSessionReferences(chunk engramsync.ChunkData, knownSessionIDs map[string]struct{}) error {
+	chunkSessionIDs := make(map[string]struct{}, len(chunk.Sessions))
+	for i, session := range chunk.Sessions {
+		sessionID := strings.TrimSpace(session.ID)
+		if sessionID == "" {
+			return fmt.Errorf("sessions[%d].id is required", i)
+		}
+		chunkSessionIDs[sessionID] = struct{}{}
+	}
+	for i, mutation := range chunk.Mutations {
+		if mutation.Entity != store.SyncEntitySession || mutation.Op != store.SyncOpUpsert {
+			continue
+		}
+		var body struct {
+			ID string `json:"id"`
+		}
+		if err := decodeSyncMutationPayload(mutation.Payload, &body); err != nil {
+			return fmt.Errorf("mutations[%d] invalid payload: %w", i, err)
+		}
+		sessionID := strings.TrimSpace(body.ID)
+		if sessionID == "" {
+			sessionID = strings.TrimSpace(mutation.EntityKey)
+		}
+		if sessionID == "" {
+			return fmt.Errorf("mutations[%d].payload.id is required for session upsert", i)
+		}
+		chunkSessionIDs[sessionID] = struct{}{}
+	}
+
+	hasSession := func(sessionID string) bool {
+		if _, ok := chunkSessionIDs[sessionID]; ok {
+			return true
+		}
+		_, ok := knownSessionIDs[sessionID]
+		return ok
+	}
+
+	for i, observation := range chunk.Observations {
+		sessionID := strings.TrimSpace(observation.SessionID)
+		if sessionID == "" {
+			return fmt.Errorf("observations[%d].session_id is required", i)
+		}
+		if !hasSession(sessionID) {
+			return fmt.Errorf("observations[%d] references missing session_id %q", i, sessionID)
 		}
 	}
-	host, _, err := net.SplitHostPort(strings.TrimSpace(r.RemoteAddr))
-	if err == nil && host != "" {
-		return host
+
+	for i, prompt := range chunk.Prompts {
+		sessionID := strings.TrimSpace(prompt.SessionID)
+		if sessionID == "" {
+			return fmt.Errorf("prompts[%d].session_id is required", i)
+		}
+		if !hasSession(sessionID) {
+			return fmt.Errorf("prompts[%d] references missing session_id %q", i, sessionID)
+		}
 	}
-	if strings.TrimSpace(r.RemoteAddr) != "" {
-		return strings.TrimSpace(r.RemoteAddr)
+
+	for i, mutation := range chunk.Mutations {
+		if mutation.Entity != store.SyncEntityObservation && mutation.Entity != store.SyncEntityPrompt {
+			continue
+		}
+		var body struct {
+			SessionID string `json:"session_id"`
+		}
+		if err := decodeSyncMutationPayload(mutation.Payload, &body); err != nil {
+			return fmt.Errorf("mutations[%d] invalid payload: %w", i, err)
+		}
+		sessionID := strings.TrimSpace(body.SessionID)
+		if mutation.Op == store.SyncOpUpsert && sessionID == "" {
+			return fmt.Errorf("mutations[%d].payload.session_id is required for upsert", i)
+		}
+		if mutation.Op == store.SyncOpUpsert && !hasSession(sessionID) {
+			return fmt.Errorf("mutations[%d] references missing session_id %q", i, sessionID)
+		}
 	}
-	return "unknown"
+	return nil
+}
+
+func jsonResponse(w http.ResponseWriter, code int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(payload)
 }

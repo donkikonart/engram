@@ -3,7 +3,7 @@
   "hooks": {
     "SessionStart": [
       {
-        "matcher": "startup",
+        "matcher": "startup|clear",
         "hooks": [
           {
             "type": "command",
@@ -21,6 +21,17 @@
             "command": "${CLAUDE_PLUGIN_ROOT}/scripts/post-compaction.sh",
             "timeout": 10,
             "statusMessage": "Recovering engram context after compaction..."
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/user-prompt-submit.sh",
+            "timeout": 2
           }
         ]
       }

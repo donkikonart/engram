@@ -1,7 +1,9 @@
 package dashboard
 
 // LoginPage renders the standalone login page (no layout wrapper).
-templ LoginPage(errorMsg string) {
+// ADAPTED: added next string parameter for post-login redirect; token-only form
+// (integrated dashboard uses ENGRAM_CLOUD_TOKEN, not user/password credentials).
+templ LoginPage(errorMsg string, next string) {
 	<!DOCTYPE html>
 	<html lang="en" data-theme="dark">
 		<head>
@@ -27,30 +29,24 @@ templ LoginPage(errorMsg string) {
 					<section class="login-container">
 						<p class="section-kicker">SIGN IN</p>
 						<h2>Sign In</h2>
-						<p class="login-copy">Use the account created with <code>engram cloud register</code> or refreshed with <code>engram cloud login</code>.</p>
+						<p class="login-copy">Use your cloud runtime token to open a signed dashboard session.</p>
 						if errorMsg != "" {
 							<div class="login-error" role="alert">
 								{ errorMsg }
 							</div>
 						}
 						<form method="post" action="/dashboard/login" class="login-form">
+							if next != "" {
+								<input type="hidden" name="next" value={ next }/>
+							}
 							<label>
-								Username or Email
-								<input
-									type="text"
-									name="identifier"
-									placeholder="username or email"
-									required
-									autofocus
-								/>
-							</label>
-							<label>
-								Password
+								Cloud token
 								<input
 									type="password"
-									name="password"
-									placeholder="password"
+									name="token"
+									placeholder="token"
 									required
+									autocomplete="off"
 								/>
 							</label>
 							<button type="submit" class="shell-button">Sign In</button>

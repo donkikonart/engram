@@ -15,8 +15,8 @@
 	--engram-accent: #ebbcba;
 	--engram-blue: #31748f;
 	--engram-shadow: rgba(9, 8, 16, 0.5);
-	--engram-font-display: "IBM Plex Mono", "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
-	--engram-font-body: "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
+	--engram-font-display: "Iosevka", "Iosevka Term", "Iosevka Fixed", "IBM Plex Mono", "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+	--engram-font-body: "Iosevka Aile", "Iosevka Etoile", "Iosevka", "Inter", "IBM Plex Sans", "Avenir Next", "Segoe UI", sans-serif;
 }
 
 [data-theme="dark"] {
@@ -166,17 +166,6 @@ a:hover {
 	overflow: hidden;
 }
 
-.app-shell::before,
-.login-shell::before {
-	content: "";
-	position: absolute;
-	inset: 0;
-	pointer-events: none;
-	background:
-		radial-gradient(circle at top right, rgba(196, 167, 231, 0.16), transparent 24%),
-		radial-gradient(circle at bottom left, rgba(49, 116, 143, 0.16), transparent 26%);
-}
-
 .shell-header,
 .shell-nav,
 .shell-main,
@@ -220,19 +209,48 @@ a:hover {
 
 .user-info {
 	display: flex;
-	align-items: center;
-	gap: 0.85rem;
+	align-items: baseline;
+	gap: 0.55rem;
 	color: var(--engram-muted);
+	padding-top: 0.45rem;
 }
 
 .user-name {
 	text-transform: lowercase;
 	letter-spacing: 0.03em;
 	font-size: 0.95rem;
+	margin-right: 0.2rem;
+}
+
+.user-link {
+	font-size: 0.78rem;
+	color: var(--engram-muted);
+	text-decoration: none;
+	letter-spacing: 0.03em;
+	background: none;
+	border: none;
+	padding: 0;
+	cursor: pointer;
+	font-family: var(--engram-font-body);
+}
+
+.user-link:hover {
+	color: var(--engram-primary);
+}
+
+.user-sep {
+	color: rgba(110, 106, 134, 0.5);
+	font-size: 0.7rem;
+}
+
+.logout-link {
+	text-transform: none;
+	line-height: 1;
 }
 
 .shell-button,
 button,
+button[type="submit"],
 button.outline.secondary {
 	border-radius: 0;
 	border: 1px solid rgba(156, 207, 216, 0.65);
@@ -247,10 +265,11 @@ button.outline.secondary {
 
 .shell-button:hover,
 button:hover,
+button[type="submit"]:hover,
 button.outline.secondary:hover {
 	border-color: rgba(196, 167, 231, 0.7);
 	background: linear-gradient(180deg, rgba(196, 167, 231, 0.85), rgba(31, 29, 46, 0.95));
-	color: var(--engram-base);
+	color: var(--engram-text);
 }
 
 .shell-nav {
@@ -348,6 +367,7 @@ nav [role="tab"][aria-selected="true"],
 	border: none;
 	background: transparent;
 	box-shadow: none;
+	min-width: 0;
 }
 
 .browser-shell {
@@ -580,6 +600,25 @@ label,
 	margin-bottom: 1rem;
 }
 
+form.browser-controls {
+	grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+	align-items: start;
+}
+
+form.browser-controls button[type="submit"] {
+	width: 100%;
+	min-width: 8rem;
+	margin: 0;
+	padding-block: var(--pico-form-element-spacing-vertical);
+	line-height: 1.5rem;
+	justify-self: stretch;
+	align-self: start;
+}
+
+.browser-controls > :only-child {
+	grid-column: 1 / -1;
+}
+
 .browser-content-frame {
 	padding: 1rem;
 	border: 1px solid rgba(110, 106, 134, 0.38);
@@ -627,17 +666,49 @@ label,
 	color: var(--engram-primary);
 }
 
+.card-link {
+	display: block;
+	color: inherit;
+	text-decoration: none;
+	cursor: pointer;
+}
+
+.card-link:hover {
+	color: inherit;
+}
+
+/* Clickable stat cards — used for drill-down from dashboard home and contributor detail. */
+.stat-card-link {
+	display: flex;
+	flex-direction: column;
+	justify-content: center;
+	gap: 0.35rem;
+	text-decoration: none;
+	color: inherit;
+	cursor: pointer;
+}
+
+.stat-card-link:hover {
+	color: var(--engram-iris);
+	border-color: rgba(196, 167, 231, 0.44);
+	text-decoration: none;
+}
+
+.metric-card.stat-card-link {
+	display: flex;
+}
+
+.card-link:hover .card {
+	transform: translateY(-1px);
+	border-color: rgba(196, 167, 231, 0.44);
+	box-shadow: 0 14px 28px rgba(9, 8, 16, 0.18), inset 0 0 0 1px rgba(196, 167, 231, 0.04);
+}
+
 .card {
 	padding: 1.15rem 1.25rem;
 	margin-bottom: 0;
 	overflow: hidden;
 	transition: border-color 180ms ease, transform 180ms ease, box-shadow 180ms ease;
-}
-
-.card:hover {
-	transform: translateY(-1px);
-	border-color: rgba(196, 167, 231, 0.44);
-	box-shadow: 0 14px 28px rgba(9, 8, 16, 0.18), inset 0 0 0 1px rgba(196, 167, 231, 0.04);
 }
 
 .observation-list,
@@ -729,10 +800,20 @@ label,
 	text-align: center;
 }
 
+.project-stats .stat-label {
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+
 table {
 	width: 100%;
 	border-collapse: collapse;
 	font-size: 0.94rem;
+}
+
+.table-scroll {
+	overflow-x: auto;
 }
 
 .data-table {
@@ -1044,5 +1125,105 @@ select:focus {
 	.dashboard-grid,
 	.project-grid {
 		grid-template-columns: 1fr;
+	}
+}
+
+/* ─── Alerts ──────────────────────────────────────────────────────────────── */
+
+.alert {
+	padding: 0.85rem 1.15rem;
+	border-radius: 6px;
+	margin-bottom: 1rem;
+	font-size: 0.92rem;
+	line-height: 1.5;
+}
+
+.alert-danger {
+	background: rgba(235, 111, 146, 0.12);
+	border: 1px solid rgba(235, 111, 146, 0.4);
+	color: #eb6f92;
+}
+
+.alert-success {
+	background: rgba(156, 207, 216, 0.12);
+	border: 1px solid rgba(156, 207, 216, 0.4);
+	color: #9ccfd8;
+}
+
+/* ─── Pagination ──────────────────────────────────────────────────────────── */
+
+.pagination-bar {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	flex-wrap: wrap;
+	gap: 0.75rem;
+	margin-top: 1.2rem;
+	padding: 0.8rem 0 0.2rem;
+	border-top: 1px solid rgba(110, 106, 134, 0.25);
+}
+
+.pagination-info {
+	font-size: 0.8rem;
+	color: var(--engram-muted);
+	font-family: var(--engram-font-display);
+	letter-spacing: 0.02em;
+}
+
+.pagination-pages,
+.pagination-size {
+	display: flex;
+	align-items: center;
+	gap: 0.25rem;
+}
+
+.pagination-size-label {
+	font-size: 0.75rem;
+	color: var(--engram-muted);
+	margin-right: 0.3rem;
+	letter-spacing: 0.04em;
+	text-transform: uppercase;
+}
+
+.page-btn {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	min-width: 1.8rem;
+	height: 1.8rem;
+	padding: 0 0.4rem;
+	font-size: 0.78rem;
+	font-family: var(--engram-font-display);
+	color: var(--engram-muted);
+	border: 1px solid rgba(110, 106, 134, 0.35);
+	background: transparent;
+	text-decoration: none;
+	cursor: pointer;
+	transition: border-color 150ms ease, color 150ms ease, background 150ms ease;
+}
+
+.page-btn:hover {
+	border-color: rgba(196, 167, 231, 0.6);
+	color: var(--engram-text);
+	background: rgba(196, 167, 231, 0.08);
+}
+
+.page-btn.active {
+	border-color: rgba(196, 167, 231, 0.7);
+	color: var(--engram-primary);
+	background: rgba(196, 167, 231, 0.14);
+	cursor: default;
+}
+
+.page-ellipsis {
+	color: var(--engram-muted);
+	font-size: 0.8rem;
+	padding: 0 0.15rem;
+}
+
+@media (max-width: 640px) {
+	.pagination-bar {
+		flex-direction: column;
+		align-items: flex-start;
 	}
 }
